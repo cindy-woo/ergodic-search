@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import time 
+import os
 
 # Dynamics and target distribution
 # The dynamics are defined as the constrained continuous time dynamical system
@@ -106,59 +107,69 @@ def optimize_trajectory(x0, phik, k, num_iters=1500, lr=1e-3):
         
         if (i+1) % 20 == 0:
             print(f"Iteration {i+1}, Loss: {loss.item()}")
-            # xf = x0.clone()
-            # tr = [xf]
-            # for step in u.detach():
-            #     xf, _ = f(xf, step)
-            #     tr.append(xf)
-            # tr = torch.stack(tr).numpy()
-            # plt.scatter(tr[:-1, 0], tr[:-1, 1], c=u.detach()[:, 2].numpy(), cmap='plasma')
-            # plt.title("Trajectory Summary")
-        #     plt.show()
     
     return u.detach()
 
+def get_files_in_folder(path):
+    files = []
+    for file in os.listdir(path):
+        item_path = os.path.join(path, file)
+        if os.path.isfile(item_path): 
+            files.append(item_path)
+    return files
+
+def load_files(file):
+    ext = os.path.splitext(file)[1].lower()
+    if ext == '.npy':
+        arr = np.load(file)
+    elif ext == '.txt':
+        arr = np.loadtxt(file, dtype=np.float32)
+    else:
+        return None
+    return torch.from_numpy(arr).float()
+
 start_time = time.time()
 
-# # Visualization of target distribution
-X, Y = torch.meshgrid(torch.linspace(0, 1, 50, dtype=torch.float32), torch.linspace(0, 1, 50, dtype=torch.float32))
-_s = torch.stack([X.ravel(), Y.ravel()]).T
+# Load entropy and gaussian maps
+entropy_maps_path = "/Users/cindy/Desktop/ergodic-search/entropy_maps"
+entropy_maps = []
+for file in (get_files_in_folder(entropy_maps_path)):
+    entropy_file = load_files(file)
+    if entropy_file != None:
+        entropy_maps.append(entropy_file)
 
-# def p(tensor):
-#     if tensor.dim() == 1:
-#         return torch.sin(torch.norm(tensor))  # No dim argument for 1D tensors
-#     else:
-#         return torch.sin(torch.norm(tensor, dim=1))
+full_maps = torch.stack(entropy_maps, dim=0)
+perm = torch.randperm(full_maps.shape[0])
+maps = full_maps[perm[:3]]
+maps = maps[0]
+H, W = maps.shape
 
 
-_s_tensor = _s.clone().detach().float()
-Z = torch.stack([p(s) for s in _s_tensor]).reshape(X.shape).detach().numpy()
-# print(X,Y)
-# print("--------------------------")
-# print(Z)
-# plt.contour(X, Y, Z)
-# plt.axis('square')
-# plt.show()
-
+# Create consistent grid
+xs = torch.linspace(0, 1, W)
+ys = torch.linspace(0, 1, H)
+X, Y = torch.meshgrid(xs, ys, indexing='xy')   
+_s = torch.stack([X.reshape(-1), Y.reshape(-1)], dim=1)
 
 # Compute the Fourier basis modes and the orthonormalization factors
-
 x0 = torch.tensor([0.54, 0.3])
 k1, k2 = np.meshgrid(np.arange(0, 20), np.arange(0, 20))
-k = torch.tensor(np.stack([k1.ravel(), k2.ravel()], axis=-1), dtype=torch.float32)
+k = torch.tensor(np.stack([k1.ravel(), k2.ravel()], axis=-1), dtype=torch.float32).unsqueeze(0)
 lamk = torch.exp(-0.8 * torch.norm(k, dim=1))
 hk = torch.tensor([get_hk(ki) for ki in k.numpy()])
-
 
 # phik, Fourier coefficients of the target distribution.
 phik = (torch.cos(_s[:, None, :] * k).prod(dim=-1) * torch.stack([p(s) for s in _s])[:, None]).sum(dim=0)
 phik_1 = phik.clone().detach().contiguous()
 phik_1 = phik / (phik[0] + 1e-8)
 fk_vals_all = torch.cos(_s[:, None, :] * k[None, :, :]).prod(dim=-1)
-phik_recon = torch.matmul(fk_vals_all, phik_1).reshape(50, 50)
+
+# Fix the reshape operation - use H and W instead of hardcoded 50
+phik_recon = torch.matmul(fk_vals_all, phik_1).reshape(H, W)
+
 optimized_u = optimize_trajectory(x0, phik_1, k)
 
-
+# Generate trajectory
 x = x0.clone()
 tr = [x]
 for step in optimized_u:
@@ -170,57 +181,16 @@ end_time = time.time()
 execution_time = end_time - start_time
 print(f"Execution time: {execution_time} seconds")
 
+# Visualization
 plt.figure(figsize=(4, 4))
-# plt.imshow(phik_recon.numpy(), extent=[0, 1, 0, 1], origin='lower', cmap='viridis')
 plt.contourf(X.numpy(), Y.numpy(), phik_recon.numpy(), cmap='viridis')
 plt.scatter(tr[1:, 0], tr[1:, 1], s=10, c = 5 * sigmoid(5 * optimized_u[:, 2]), cmap='plasma')
 plt.title("Information Map")
-# color = sigmoid(10 * optimized_u[:, 2]).detach().numpy()
+
 plt.figure(figsize=(3, 3))
 plt.imshow(phik_recon.numpy(), extent=[0, 1, 0, 1], origin='lower', cmap='viridis')
 plt.scatter(tr[1:, 0], tr[1:, 1], s=5, c='red')  # smaller red dots
 plt.title("Original Map and Trajectory")
-
-# color = len(optimized_u[:,2])*[0]
-# color = torch.tensor(color, dtype=torch.float32, device=k.device)
-# ck = get_ck_weighted(tr, k, color, hk)
-# ck_recon = (fk_vals_all @ ck).reshape(X.shape).cpu().numpy()
-# #ck_recon = ck_recon/ck_recon.sum()
-# N = 25
-# percent = 0.00000001
-# color = torch.tensor(color, dtype=torch.float32, device=k.device)
-# idx = sorted(range(len(optimized_u[:,2])), key = lambda sub: optimized_u[sub,2])[-25:]
-# print(idx)
-# for i in range(100):
-#     if i in idx:
-#         color[i] = 1
-#     else:
-#         color[i] = 0
-# print(len(color))
-# color[-1] = 0
-# tr = torch.tensor(tr, dtype=torch.float32, device=k.device)
-# tr = tr[1:, :2]
-# # ck = get_ck_weighted(tr, k, color, hk)
-# # ck_recon = (fk_vals_all @ ck).reshape(X.shape).cpu().numpy()
-# plt.figure(figsize=(4,4))
-# plt.contourf(X.numpy(), Y.numpy(), phik_recon.numpy(), cmap='viridis')
-# plt.scatter(tr[:,0],tr[:,1], c=color, cmap = 'Reds')
-# plt.title("RED")
-
-# print("optimized_u[:, 2]", optimized_u[:, 2])
-# lam = sigmoid(5 * optimized_u[:, 2])
-# # lam = torch.clamp(sigmoid(5 * optimized_u[:, 2]), 0.05, 1.0).cpu().numpy()
-# print("lam")
-# print(lam)
-# # print(len(lam), "____")
-# red_idx = np.where(lam > 0.066)[0]
-# print("red_idx", red_idx)
-# plt.figure(figsize=(4,4))
-# plt.contourf(X.numpy(), Y.numpy(), phik_recon.numpy(), cmap='viridis')
-# pts=tr[1:]
-# plt.scatter(pts[red_idx, 0], pts[red_idx, 1], s=10, c='red')
-# plt.title("Red and White")
-
 
 plt.axis('square')
 plt.xlim(0, 1)

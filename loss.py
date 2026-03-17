@@ -6,7 +6,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import random
-import time
+import xlsxwriter
 
 # Dynamics and target distribution
 # The dynamics are defined as the constrained continuous time dynamical system
@@ -148,7 +148,7 @@ def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T
             return head
         else:
             return torch.cat([head, tail], dim = 0)
-
+    loss_list = []
     for i in range(num_iters):
         def closure():
             optimizer.zero_grad()
