@@ -53,12 +53,15 @@ def get_ck_weighted(tr, k_expanded, weights, hk):
     return (fk.T @ weights) / (Z * hk)
 
 # ergodic metric + other costs----
+# Primary losss function for trajectory optimization
+# ergodic metric (how well the trajcetory matches the information distribution) + regularization + penalty
 def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, head_w=1.0, tail_w=0.25):
     displacements = 0.1 * u[:, :2]
     tr = torch.cumsum(displacements, dim=0) + x0
     tr = tr.clamp(0.0, 1.0)
 
     T = u.shape[0]
+    # sensor activation per timestep, clamp between 0.05 and 1.0
     lam = torch.clamp(torch.sigmoid(5 * u[:, 2]), 0.05, 1.0)
 
     # determine the weights of head and tail for the amount of contributions to the trajectory
