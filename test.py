@@ -8,18 +8,26 @@ import matplotlib.pyplot as plt
 import random
 import time
 
-# Dynamics and target distribution
-# The dynamics are defined as the constrained continuous time dynamical system
-# The target distribution, for which information is distributed within the continuous search space
-@torch.jit.script
-def p(x):
-    return torch.exp(-190.5 * torch.sum((x[:2] - 0.27)**2)) \
-           + torch.exp(-180.5 * torch.sum((x[:2] - 0.75)**2))
+# # Dynamics and target distribution
+# # The dynamics are defined as the constrained continuous time dynamical system
+# # The target distribution, for which information is distributed within the continuous search space
+# # -----------------------------------------------------------------------
+# # TUNING PARAMETER
+# # -190.5 and -180.5 are the coefficients that control the sharpness of the peaks in the target distribution
+# @torch.jit.script
+# def p(x):
+#     return torch.exp(-190.5 * torch.sum((x[:2] - 0.27)**2)) \
+#            + torch.exp(-180.5 * torch.sum((x[:2] - 0.75)**2))
 
 # dynamics using discrete time eulerintegration
+# how state x changes based on input u
+# -----------------------------------------------------------------------
+# TUNING PARAMETER
+# step size, 0.07, controls how much the state changes in response to the input u at each time step.
+# high step size: bigger steps, more aggressive exploration but potentially less stable trajectories
 @torch.jit.script
 def f(x, u):
-    xnew = x[:2] + 0.1 * u[:2]
+    xnew = x[:2] + 0.07 * u[:2]
     xnew = torch.clamp(xnew, 0, 1)
     return xnew, xnew
 
@@ -33,7 +41,7 @@ def get_hk(k):
     return np.sqrt(np.prod(_hk))
 
 
-# # Ergodic metric and sample-weighted ergodic metric
+# Ergodic metric and sample-weighted ergodic metric
 # def get_ck_weighted(tr, k_expanded, lam, hk):
 #     weighted_fk = torch.prod(torch.cos(tr[:, None, :] * k_expanded), dim = -1).T @ lam
 #     ck = weighted_fk / (hk + 1e-8)
@@ -73,8 +81,11 @@ def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, 
     iy = (tr[:, 1] * (H - 1)).long().clamp(0, H - 1)
     info_values = info_map[iy, ix]
 
-    # emphasize head in the along-path reward too
-    reward_term = -0.30 * torch.sum(w * info_values**3)
+    # emphasize head in the along-path reward too. 
+    # reward_term = -0.30 * torch.sum(w * info_values**3)
+    # multiply by 'lam' so we only get the reward if the sensor is actually ON in the hot spot
+    reward_term = -0.30 * torch.sum(lam * w * info_values**3)
+    # print("-0.30 * torch.sum(lam * w * info_values**3)", reward_term)
 
     loss = torch.sum(lamk * (phik_normed - ck_normed)**2) \
             + 0.001 * torch.mean(u[:, :2]**2) \
@@ -141,7 +152,9 @@ def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T
     head = torch.nn.Parameter(head)
 
     # LBFGS optimizer
-    optimizer = torch.optim.LBFGS([head], lr=lr, max_iter=20, history_size=10)
+    # optimizer = torch.optim.LBFGS([head], lr=lr, max_iter=20, history_size=10)
+    optimizer = torch.optim.Adam([head], lr=lr)
+    optimizer.zero_grad()
 
     def u_builder(head, tail):
         if tail is None:
@@ -150,24 +163,34 @@ def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T
             return torch.cat([head, tail], dim = 0)
 
     for i in range(num_iters):
-        def closure():
-            optimizer.zero_grad()
-            u = u_builder(head, tail)
-            max_val = torch.max(info_map)
-            jy, ix = torch.where(info_map == max_val)
-            gx = ix.float().mean() / max(W - 1, 1) 
-            gy = jy.float().mean() / max(H - 1, 1)
-            goal = torch.tensor([gx, gy], dtype=torch.float32, device=u.device)
-            loss = loss_with_goal(u, x0, phik, k_expanded, lamk, hk, info_map, tau=tau, head_w=1.0, tail_w=0.10, goal = goal, goal_w = 2.5)
-            loss.backward()
-            assert head.grad is not None and head.grad.abs().mean().item() > 0, "Head not receiving gradients."
-            assert not (tail is not None and tail.requires_grad), "Tail should be frozen."
-            torch.nn.utils.clip_grad_norm_([head], max_norm=0.1)
-            return loss
+        # def closure():
+        #     optimizer.zero_grad()
+        #     u = u_builder(head, tail)
+        #     max_val = torch.max(info_map)
+        #     jy, ix = torch.where(info_map == max_val)
+        #     gx = ix.float().mean() / max(W - 1, 1) 
+        #     gy = jy.float().mean() / max(H - 1, 1)
+        #     goal = torch.tensor([gx, gy], dtype=torch.float32, device=u.device)
+        #     loss = loss_with_goal(u, x0, phik, k_expanded, lamk, hk, info_map, tau=tau, head_w=1.0, tail_w=0.10, goal = goal, goal_w = 2.5)
+        #     loss.backward()
+        #     assert head.grad is not None and head.grad.abs().mean().item() > 0, "Head not receiving gradients."
+        #     assert not (tail is not None and tail.requires_grad), "Tail should be frozen."
+        #     torch.nn.utils.clip_grad_norm_([head], max_norm=0.1)
+        #     return loss
+        
         # if (i+1) % 100 == 0:
         #     if not torch.isfinite(loss).all().item():
         #         print("Warning: non-finite loss encountered.")
-        loss = optimizer.step(closure)
+        # loss = optimizer.step(closure)
+        u = u_builder(head, tail)
+        max_val = torch.max(info_map)
+        jy, ix = torch.where(info_map == max_val)
+        gx = ix.float().mean() / max(W - 1, 1) 
+        gy = jy.float().mean() / max(H - 1, 1)
+        goal = torch.tensor([gx, gy], dtype=torch.float32, device=u.device)
+        loss = loss_with_goal(u, x0, phik, k_expanded, lamk, hk, info_map, tau=tau, head_w=1.0, tail_w=0.10, goal = goal, goal_w = 2.5)
+        loss.backward()
+        optimizer.step()
         with torch.no_grad():
                 head[:, :2].clamp_(min = -1.0, max = 1.0)
                 head[:, 2].clamp_(min = -1.0, max = 1.0)
@@ -334,7 +357,9 @@ def load_files(file):
 
 # Compute the Fourier basis modes and the orthonormalization factors
 
+
 # Get map information and set them into a list
+# Get the list of maps and stack into a tensor
 # Change the maps path accordingly
 entropy_maps_path = "/Users/cindy/Desktop/ergodic-search/entropy_maps"
 entropy_maps = []
@@ -348,23 +373,39 @@ for file in (get_files_in_folder(entropy_maps_path)):
 #     gaussian_file = load_files(file)
 #     if gaussian_file != None:
 #         gaussian_maps.append(gaussian_file)
-full_maps = torch.stack(entropy_maps, dim=0)
-perm = torch.randperm(full_maps.shape[0])
-maps = full_maps[perm[:5]]
 
-# Sample grid to match the resolution
+# Randomly select n number of maps for testing
+full_maps = torch.stack(entropy_maps)
+perm = torch.randperm(full_maps.shape[0])
+maps = full_maps[perm[:4]]
+
+# Sample grid of (0 to 1) to match the resolution
 N, H, W = maps.shape
 xs = torch.linspace(0, 1, W)
 ys = torch.linspace(0, 1, H)
 X, Y = torch.meshgrid(xs, ys, indexing='xy')   
 _s = torch.stack([ X.reshape(-1), Y.reshape(-1) ], dim=1)
 
-
+# Fourier Basis, k, for defining a 20x20 grid of frequency modes to represent a 
+# sum of 400 cosine waves
 k1, k2 = np.meshgrid(np.arange(0, 20), np.arange(0, 20))
 k = torch.tensor(np.stack([k1.ravel(), k2.ravel()], axis=-1), dtype=torch.float32)
-k_expanded = k.unsqueeze(0)
-lamk = torch.exp(-0.15 * (torch.norm(k, dim=1) ** 2))
+
+# --------------------------------------------------------------------
+# TUNING PARAMETER
+# frequency weighting for each k
+# print("-0.8 * torch.norm(k, dim=1)", -0.8 * torch.norm(k, dim=1),"\n -0.15 * (torch.norm(k, dim=1) ** 2)", -0.15 * (torch.norm(k, dim=1) ** 2))
+# this wll give me much more aggressive downweighting of higher frequencies, 
+# focus on large global blobs. might miss out details
+# lmak = torch.exp(-0.15 * (torch.norm(k, dim=1) ** 2))
+# this gives more detailed but potentially jittery trajectories
+lamk = torch.exp(-0.8 * torch.norm(k, dim=1))
+
+# orthonormalization factor for each k
 hk = torch.clamp(torch.tensor([get_hk(ki) for ki in k.numpy()]), min=1e-6)
+#represent the Fourier basis modes (frequencies)
+k_expanded = k.unsqueeze(0)
+# Calculate the values of the Fourier basis functions at the sample points, _s, for all Fourier modes, k_expanded
 fk_vals_all = torch.cos(_s[:, None, :] * k_expanded).prod(dim=-1)
 
 
