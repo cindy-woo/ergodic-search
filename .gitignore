@@ -35,10 +35,6 @@ wheels/
 *~
 .DS_Store
 
-# Data files (likely generated or external)
-*.npy
-*.txt
-trajectories/
 
 # Environment variables
 .env
