@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
 import time 
+import os
 
 # Dynamics and target distribution
 # The dynamics are defined as the constrained continuous time dynamical system
@@ -120,24 +121,29 @@ def optimize_trajectory(x0, phik, k, num_iters=1500, lr=1e-3):
 
 start_time = time.time()
 
-# # Visualization of target distribution
-X, Y = torch.meshgrid(torch.linspace(0, 1, 50, dtype=torch.float32), torch.linspace(0, 1, 50, dtype=torch.float32))
+# Load a single map from the entropy_maps folder
+entropy_maps_path = "/Users/cindy/Desktop/ergodic-search/entropy_maps"
+map_files = [f for f in os.listdir(entropy_maps_path) if f.endswith('.npy')]
+if not map_files:
+    raise FileNotFoundError("No .npy files found in entropy_maps directory")
+
+# Select a map (e.g., the first one or random)
+map_to_load = os.path.join(entropy_maps_path, random.choice(map_files))
+print(f"Loading map: {map_to_load}")
+loaded_map = np.load(map_to_load)
+map_tensor = torch.from_numpy(loaded_map).float()
+H, W = map_tensor.shape
+
+# Match the grid to the loaded map resolution
+# Use indexing='xy' to ensure X varies along columns, Y along rows (standard Cartesian)
+X, Y = torch.meshgrid(torch.linspace(0, 1, W, dtype=torch.float32), torch.linspace(0, 1, H, dtype=torch.float32), indexing='xy')
 _s = torch.stack([X.ravel(), Y.ravel()]).T
 
-# def p(tensor):
-#     if tensor.dim() == 1:
-#         return torch.sin(torch.norm(tensor))  # No dim argument for 1D tensors
-#     else:
-#         return torch.sin(torch.norm(tensor, dim=1))
-
-
-_s_tensor = _s.clone().detach().float()
-Z = torch.stack([p(s) for s in _s_tensor]).reshape(X.shape).detach().numpy()
-# print(X,Y)
-# print("--------------------------")
-# print(Z)
-# plt.contour(X, Y, Z)
-# plt.axis('square')
+# # Visualization of target distribution
+# Z = map_tensor.detach().numpy()
+# plt.imshow(Z, extent=[0, 1, 0, 1], origin='lower')
+# plt.colorbar()
+# plt.title("Target Distribution (Entropy Map)")
 # plt.show()
 
 
@@ -151,11 +157,16 @@ hk = torch.tensor([get_hk(ki) for ki in k.numpy()])
 
 
 # phik, Fourier coefficients of the target distribution.
-phik = (torch.cos(_s[:, None, :] * k).prod(dim=-1) * torch.stack([p(s) for s in _s])[:, None]).sum(dim=0)
-phik_1 = phik.clone().detach().contiguous()
+# Efficient vectorized computation for the map data
+fk_vals = torch.cos(_s[:, None, :] * k[None, :, :]).prod(dim=-1)
+# Old version (without normalization):
+# phik = (fk_vals * map_tensor.ravel()[:, None]).sum(dim=0)
+# New version (normalized by grid count to approximate the integral - discrete -> continuous):
+num_pixels = H * W
+phik = (fk_vals * map_tensor.ravel()[:, None]).sum(dim=0) / num_pixels
 phik_1 = phik / (phik[0] + 1e-8)
-fk_vals_all = torch.cos(_s[:, None, :] * k[None, :, :]).prod(dim=-1)
-phik_recon = torch.matmul(fk_vals_all, phik_1).reshape(50, 50)
+# Old version (without normalization):
+phik_recon = torch.matmul(fk_vals, phik_1).reshape(W, H)
 optimized_u = optimize_trajectory(x0, phik_1, k)
 
 
@@ -208,18 +219,19 @@ plt.title("Original Map and Trajectory")
 # plt.title("RED")
 
 # print("optimized_u[:, 2]", optimized_u[:, 2])
-# lam = sigmoid(5 * optimized_u[:, 2])
-# # lam = torch.clamp(sigmoid(5 * optimized_u[:, 2]), 0.05, 1.0).cpu().numpy()
+lam = sigmoid(5 * optimized_u[:, 2])
+# lam = torch.clamp(sigmoid(5 * optimized_u[:, 2]), 0.05, 1.0).cpu().numpy()
 # print("lam")
 # print(lam)
-# # print(len(lam), "____")
-# red_idx = np.where(lam > 0.066)[0]
+# print(len(lam), "____")
+red_idx = np.where(lam > 0.066)[0]
 # print("red_idx", red_idx)
-# plt.figure(figsize=(4,4))
-# plt.contourf(X.numpy(), Y.numpy(), phik_recon.numpy(), cmap='viridis')
-# pts=tr[1:]
-# plt.scatter(pts[red_idx, 0], pts[red_idx, 1], s=10, c='red')
-# plt.title("Red and White")
+plt.figure(figsize=(4,4))
+plt.contourf(X.numpy(), Y.numpy(), phik_recon.numpy(), cmap='viridis')
+pts=tr[1:]
+plt.scatter(pts[:, 0], pts[:, 1], s=10, c='white')
+plt.scatter(pts[red_idx, 0], pts[red_idx, 1], s=10, c='red')
+plt.title("Red and White")
 
 
 plt.axis('square')
