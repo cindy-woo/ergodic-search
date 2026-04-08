@@ -6,7 +6,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import random
-import xlsxwriter
+import time
 
 # Dynamics and target distribution
 # The dynamics are defined as the constrained continuous time dynamical system
@@ -336,7 +336,7 @@ def load_files(file):
 
 # Get map information and set them into a list
 # Change the maps path accordingly
-entropy_maps_path = "/Users/cindy/Desktop/ergodic-search/entropy_maps"
+entropy_maps_path = "/home/younkyuw/Documents/ergodic-search/entropy_maps"
 entropy_maps = []
 for file in (get_files_in_folder(entropy_maps_path)):
     entropy_file = load_files(file)

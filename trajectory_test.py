@@ -477,6 +477,7 @@ def evaluate_coverage(traj_list, maps, phik_list, k_expanded, lamk, hk, sensor_r
         )
 
         # KL(P || V) for completeness
+
         P = maps[i]
         P_np = P.cpu().numpy() if isinstance(P, torch.Tensor) else np.asarray(P)
         P_np = P_np - P_np.min()
@@ -498,7 +499,7 @@ start_time = time.time()
 
 # Get map information and set them into a list
 # Change the maps path accordingly
-entropy_maps_path = "/Users/cindy/Desktop/ergodic-search/entropy_maps"
+entropy_maps_path = "/home/younkyuw/Documents/ergodic-search/entropy_maps"
 entropy_maps = []
 for file in (get_files_in_folder(entropy_maps_path)):
     entropy_file = load_files(file)

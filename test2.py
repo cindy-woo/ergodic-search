@@ -241,21 +241,21 @@ start_time = time.time()
 
 # Get map information and set them into a list
 # Change the maps path accordingly
-entropy_maps_path = "/Users/cindy/Desktop/ergodic-search/entropy_maps"
+entropy_maps_path = "/home/younkyuw/Documents/ergodic-search/entropy_maps"
 entropy_maps = []
 for file in (get_files_in_folder(entropy_maps_path)):
     entropy_file = load_files(file)
     if entropy_file != None:
         entropy_maps.append(entropy_file)
-gaussian_maps_path = "/Users/cindy/Desktop/ergodic-search/gaussian_maps"
-gaussian_maps = []
-for file in (get_files_in_folder(gaussian_maps_path)):
-    gaussian_file = load_files(file)
-    if gaussian_file != None:
-        gaussian_maps.append(gaussian_file)
+# gaussian_maps_path = "/Users/cindy/Desktop/ergodic-search/gaussian_maps"
+# gaussian_maps = []
+# for file in (get_files_in_folder(gaussian_maps_path)):
+#     gaussian_file = load_files(file)
+#     if gaussian_file != None:
+#         gaussian_maps.append(gaussian_file)
 full_maps = torch.stack(entropy_maps, dim=0)
 perm = torch.randperm(full_maps.shape[0])
-maps = full_maps[perm[:1]]
+maps = full_maps[perm[:4]]
 # all_maps = torch.stack(entropy_maps + gaussian_maps, dim=0)
 
 # Sample grid to match the resolution
