@@ -53,8 +53,11 @@ def get_ck_weighted(tr, k_expanded, weights, hk):
     return (fk.T @ weights) / (Z * hk)
 
 # ergodic metric + other costs----
-# Primary losss function for trajectory optimization
+# Primary loss function for trajectory optimization
 # ergodic metric (how well the trajcetory matches the information distribution) + regularization + penalty
+# Overall, the tells how well the path explores the interesting areas in ergodic metric,
+# how much energy the robot used, how msoothly the robot moved, if the robot stayed within the map,
+# how much the robot activated its sensors, and ow much valuable information the robot gathered
 def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, head_w=1.0, tail_w=0.25):
     displacements = 0.1 * u[:, :2]
     tr = torch.cumsum(displacements, dim=0) + x0
@@ -62,6 +65,9 @@ def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, 
 
     T = u.shape[0]
     # sensor activation per timestep, clamp between 0.05 and 1.0
+    # -----------------------------------------------------------------------
+    # TUNING PARAMETER
+    # sigmoid steepness for lam (5) and min clamp for lam (0.05)
     lam = torch.clamp(torch.sigmoid(5 * u[:, 2]), 0.05, 1.0)
 
     # determine the weights of head and tail for the amount of contributions to the trajectory
@@ -71,6 +77,9 @@ def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, 
         w[tau:] = tail_w
 
     # add exponetial discount
+    # -----------------------------------------------------------------------
+    # TUNING PARAMETER
+    # the rate of exponential discount (2.0) controls how quickly the influence of future states diminishes
     disc = torch.exp(-2.0 * torch.arange(T, device=u.device, dtype=torch.float32) / T)
     w = w * disc
 
@@ -87,9 +96,16 @@ def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, 
     # emphasize head in the along-path reward too. 
     # reward_term = -0.30 * torch.sum(w * info_values**3)
     # multiply by 'lam' so we only get the reward if the sensor is actually ON in the hot spot
+    # -----------------------------------------------------------------------
+    # TUNING PARAMETER
+    # -0.30 for how strongly the robot is attracted to high-information areas
+    # exponent 3 of reward for high information values, how strongly should high-information areas be priritized
     reward_term = -0.30 * torch.sum(lam * w * info_values**3)
-    # print("-0.30 * torch.sum(lam * w * info_values**3)", reward_term)
 
+    # control energy + smoothness + state barrier + lambda sparsity + lambda barrier + reward
+    # -----------------------------------------------------------------------
+    # TUNING PARAMETER
+    # 0.001 control energy cost, 0.001 smoothness penalty, 10 state barrier penalty, 0.0001 lambda sparsity penalty, 10 lambda barrier penalty
     loss = torch.sum(lamk * (phik_normed - ck_normed)**2) \
             + 0.001 * torch.mean(u[:, :2]**2) \
             + 0.001 * torch.sum((u[1:, :2] - u[:-1, :2])**2) \
@@ -100,7 +116,7 @@ def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, 
     return loss
 
 
-def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T = 100, tau = 9, num_iters=1500, lr=1e-3):
+def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T = 100, tau = 10, num_iters=1500, lr=1e-3):
     # u = torch.empty((T, 3), dtype=torch.float32)
     # u[:, :2].normal_(mean=0.0, std=0.01)
     # u[:, 2].uniform_(-0.5, 0.5)
@@ -364,7 +380,8 @@ def load_files(file):
 # Get map information and set them into a list
 # Get the list of maps and stack into a tensor
 # Change the maps path accordingly
-entropy_maps_path = "/home/younkyuw/Documents/ergodic-search/entropy_maps"
+# entropy_maps_path = "/home/younkyuw/Desktop/ergodic-search/entropy_maps"
+entropy_maps_path = "/Users/cindy/Desktop/ergodic-search/entropy_maps"
 entropy_maps = []
 for file in (get_files_in_folder(entropy_maps_path)):
     entropy_file = load_files(file)
@@ -421,32 +438,32 @@ pts = []
 for t in trajectory:
     pts.append(t[1:, :2])
 
-for i in range(len(trajectory)):
+num_cycles = len(trajectory)
+fig, axes = plt.subplots(1, num_cycles, figsize=(4 * num_cycles, 4), squeeze=False)
+axes = axes.ravel()
+
+for i in range(num_cycles):
     tr = trajectory[i]
     pts_i = tr[1:, :2]
     topk = k_idx[i] 
     phik = phik_list[i]    
 
     phik_recon = torch.matmul(fk_vals_all, phik).reshape(H, W)
-
-    plt.figure(figsize=(3, 3))
-    plt.contourf(X.numpy(), Y.numpy(), phik_recon, cmap='viridis')
-    plt.scatter(pts_i[:, 0], pts_i[:, 1], s=10, c='white')
-    plt.scatter(pts_i[topk, 0], pts_i[topk, 1], s=15, c='red')
-    plt.title("RED")
+    ax = axes[i]
 
     tau = 30
-    plt.figure(figsize=(3, 3))
-    plt.imshow(phik_recon, extent=[0, 1, 0, 1], origin='lower', cmap='viridis')
-    plt.contourf(X.numpy(), Y.numpy(), phik_recon, cmap='viridis')
-    plt.scatter(tr[1:tau, 0], tr[1:tau, 1], s=5, c='white')
-    plt.scatter(tr[tau:, 0], tr[tau:, 1], s=5, c='red') 
-    plt.scatter(tr[0, 0], tr[0, 1], c='w', s=50, marker='X')
-    plt.title("Original Map and Trajectory")
-    plt.axis('square')
-    plt.xlim(0, 1); plt.ylim(0, 1)
-    plt.tight_layout()
-    plt.draw()
+    ax.imshow(phik_recon, extent=[0, 1, 0, 1], origin='lower', cmap='viridis')
+    ax.contourf(X.numpy(), Y.numpy(), phik_recon, cmap='viridis')
+    ax.scatter(tr[1:tau, 0], tr[1:tau, 1], s=5, c='white')
+    ax.scatter(tr[tau:, 0], tr[tau:, 1], s=5, c='red')
+    ax.scatter(pts_i[topk, 0], pts_i[topk, 1], s=15, c='cyan')
+    ax.scatter(tr[0, 0], tr[0, 1], c='w', s=50, marker='X')
+    ax.set_title(f"Trajectory {i + 1}")
+    ax.set_aspect('equal')
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+
+fig.tight_layout()
 
 
 plt.show()
