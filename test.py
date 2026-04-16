@@ -59,7 +59,7 @@ def get_ck_weighted(tr, k_expanded, weights, hk):
 # how much energy the robot used, how msoothly the robot moved, if the robot stayed within the map,
 # how much the robot activated its sensors, and ow much valuable information the robot gathered
 def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, head_w=1.0, tail_w=0.25):
-    displacements = 0.1 * u[:, :2]
+    displacements = 0.07 * u[:, :2]
     tr = torch.cumsum(displacements, dim=0) + x0
     tr = tr.clamp(0.0, 1.0)
 
@@ -412,23 +412,25 @@ for file in (get_files_in_folder(entropy_maps_path)):
 full_maps = torch.stack(entropy_maps)
 n_cycles = 4
 
+# ===========================================================================
 # Option A: every cycle uses a NEW map (no immediate repeats).
 # Uncomment this block to use all-new maps.
-perm = torch.randperm(full_maps.shape[0])
-maps = full_maps[perm[:n_cycles]]
-
+# perm = torch.randperm(full_maps.shape[0])
+# maps = full_maps[perm[:n_cycles]]
+# ===========================================================================
 # Option B: current map may be SAME as previous map for some cycles.
 # Uncomment this block (and comment Option A) to inject repeats.
-# repeat_prob = 0.5  # probability to reuse previous map
-# perm = torch.randperm(full_maps.shape[0])
-# seed_pool = full_maps[perm[:n_cycles]]
-# maps_list = [seed_pool[0]]
-# for i in range(1, n_cycles):
-#     if random.random() < repeat_prob:
-#         maps_list.append(maps_list[-1].clone())
-#     else:
-#         maps_list.append(seed_pool[i])
-# maps = torch.stack(maps_list, dim=0)
+repeat_prob = 0.5  # probability to reuse previous map
+perm = torch.randperm(full_maps.shape[0])
+seed_pool = full_maps[perm[:n_cycles]]
+maps_list = [seed_pool[0]]
+for i in range(1, n_cycles):
+    if random.random() < repeat_prob:
+        maps_list.append(maps_list[-1].clone())
+    else:
+        maps_list.append(seed_pool[i])
+maps = torch.stack(maps_list, dim=0)
+# ===========================================================================
 
 # Sample grid of (0 to 1) to match the resolution
 N, H, W = maps.shape
