@@ -116,7 +116,7 @@ def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, 
     return loss
 
 
-def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T = 100, tau = 10, num_iters=1500, lr=1e-3):
+def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T=100, tau=20, num_iters=1500, lr=1e-3):
     # u = torch.empty((T, 3), dtype=torch.float32)
     # u[:, :2].normal_(mean=0.0, std=0.01)
     # u[:, 2].uniform_(-0.5, 0.5)
@@ -139,47 +139,43 @@ def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T
     #     u = u.clone().detach().requires_grad_()
     #     print("u for else", u.shape)
     
-    # ITOMP style replanning loop
-    # If u_prev exists, warm-start from that. If not, random-init. Normally, only the inital trajectory will be None
+    tau = int(min(max(tau, 1), T))
+
+    # Initial call (no previous trajectory): optimize the full horizon.
     if u_prev is None:
-        tail = torch.empty((T - tau, 3)).normal_(mean=0.0, std=0.01)
-        tail[:, 2].uniform_(-0.5, 0.5)
-        head = torch.empty((tau, 3)).normal_(mean=0.0, std=0.01)
+        head = torch.empty((T, 3), device=x0.device, dtype=torch.float32)
+        head[:, :2].normal_(mean=0.0, std=0.01)
         head[:, 2].uniform_(-0.5, 0.5)
+        tail = None
+        loss_tau = T
     else:
-        tail_prev = u_prev.detach().to(device = x0.device, dtype = torch.float32)
-        # print("tail_prev shape", tail_prev.shape)
-        target_len = max(0, T - tau)
-        # print("target_len shape", target_len)
-        if tail_prev.shape[0] >= target_len:
-            tail = tail_prev[:target_len]
-            # print("tail_prev.shape[0] >= target_len")
-            # print("tail shape", tail.shape)
-            # print("first 20 tail prev", tail_prev[:20])
-            # print("first 20 tail", tail[:20])
+        # Warm start from previous controls; optimize only the head segment.
+        u_seed = u_prev.detach().to(device=x0.device, dtype=torch.float32)
+        if u_seed.shape[0] >= T:
+            u_seed = u_seed[:T]
         else:
-            padding = torch.empty((target_len - tail_prev.shape[0], 3)).normal_(mean = 0.0, std = 0.01)
-            padding[:, 2].uniform_(-0.5, 0.5)
-            tail = torch.cat([tail_prev, padding], dim = 0)
-            # print("padding on")
-            # print("padding shape", padding.shape)
-            # print("tail shape", tail.shape)
-        # hybrid head seed
-        head = tail[:tau].clone()
-        head[:,2].zero_()
-        head += 0.05 * torch.randn_like(head) # set noise, if big change in map -> crank up the noise
+            pad = torch.empty((T - u_seed.shape[0], 3), device=x0.device, dtype=torch.float32)
+            pad[:, :2].normal_(mean=0.0, std=0.01)
+            pad[:, 2].uniform_(-0.5, 0.5)
+            u_seed = torch.cat([u_seed, pad], dim=0)
+
+        head = u_seed[:tau].clone()
+        head[:, 2].zero_()
+        head += 0.05 * torch.randn_like(head)
+        tail = u_seed[tau:].clone().detach()
+        loss_tau = tau
     head = torch.nn.Parameter(head)
 
     # LBFGS optimizer
     # optimizer = torch.optim.LBFGS([head], lr=lr, max_iter=20, history_size=10)
     optimizer = torch.optim.Adam([head], lr=lr)
-    optimizer.zero_grad()
-
     def u_builder(head, tail):
         if tail is None:
             return head
         else:
             return torch.cat([head, tail], dim = 0)
+
+    H_map, W_map = info_map.shape
 
     for i in range(num_iters):
         # def closure():
@@ -201,13 +197,17 @@ def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T
         #     if not torch.isfinite(loss).all().item():
         #         print("Warning: non-finite loss encountered.")
         # loss = optimizer.step(closure)
+        optimizer.zero_grad()
         u = u_builder(head, tail)
         max_val = torch.max(info_map)
         jy, ix = torch.where(info_map == max_val)
-        gx = ix.float().mean() / max(W - 1, 1) 
-        gy = jy.float().mean() / max(H - 1, 1)
+        gx = ix.float().mean() / max(W_map - 1, 1)
+        gy = jy.float().mean() / max(H_map - 1, 1)
         goal = torch.tensor([gx, gy], dtype=torch.float32, device=u.device)
-        loss = loss_with_goal(u, x0, phik, k_expanded, lamk, hk, info_map, tau=tau, head_w=1.0, tail_w=0.10, goal = goal, goal_w = 2.5)
+        loss = loss_with_goal(
+            u, x0, phik, k_expanded, lamk, hk, info_map,
+            tau=loss_tau, head_w=1.0, tail_w=0.10, goal=goal, goal_w=2.5
+        )
         loss.backward()
         optimizer.step()
         with torch.no_grad():
@@ -223,14 +223,14 @@ def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T
             # tr = torch.stack(tr).numpy()
             # plt.scatter(tr[:-1, 0], tr[:-1, 1], c=u.detach()[:, 2].numpy(), cmap='plasma')
             # plt.show()
-        u = u_builder(head, tail).detach()
-        if u.shape[0] != T:
-            if u.shape[0] > T:
-                u = u[:T]
-            else:
-                padding = torch.zeros((T - u.shape[0], 3), device = u.device, dtype = torch.float32)
-                padding[:, :] = u[-1, :].detach()
-                u = torch.cat([u, padding], dim = 0)
+    u = u_builder(head, tail).detach()
+    if u.shape[0] != T:
+        if u.shape[0] > T:
+            u = u[:T]
+        else:
+            padding = torch.zeros((T - u.shape[0], 3), device=u.device, dtype=torch.float32)
+            padding[:, :] = u[-1, :].detach()
+            u = torch.cat([u, padding], dim=0)
     return u
 
 def check_itomp_consistency(u_prev, u_opt, T = 100, tau = 9):
@@ -262,97 +262,111 @@ def loss_with_goal(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, head_w
         term = goal_w * (x - goal).pow(2).sum()
     return lambda_erg + term
 
+def rollout_states(x0, u):
+    x = x0.clone()
+    tr = [x]
+    for step in u:
+        x, _ = f(x, step[:2])
+        tr.append(x)
+    return torch.stack(tr)
+
+def controls_from_states(states, dynamics_scale=0.07):
+    deltas = states[1:] - states[:-1]
+    u = torch.zeros((states.shape[0] - 1, 3), dtype=torch.float32, device=states.device)
+    u[:, :2] = deltas / dynamics_scale
+    u[:, :2].clamp_(min=-1.0, max=1.0)
+    return u
+
+def maps_are_same(map_a, map_b, atol=1e-6, rtol=1e-5):
+    return torch.allclose(map_a, map_b, atol=atol, rtol=rtol)
+
 # returns trajectory as list of states
-def replanning(maps, _s, k_expanded, lamk, num_iters=1500):
-    u_prev = None
-    # phik_prev = None
-    x0 = torch.tensor([0.54, 0.3])
+def replanning(maps, _s, k_expanded, lamk, num_iters=1500, T=100, tau=20):
+    x_init = torch.tensor([0.54, 0.3], dtype=torch.float32)
+    x0 = x_init.clone()
     N, H, W = maps.shape
-    tau = 30
     trajectories, k_idx, phik_list = [], [], []
+    full_trajectories = []
     time_list = []
+    last_map = None
+
+    active_phik = None
+    active_plan_u = None
+    active_plan_states = None
+    active_plan_cursor = 0
+    active_plan_mode = "forward"
 
     # Each new plan with the tail of the previous u
     for i, info_map in enumerate(maps):
         start_time = time.time()
         info_map = info_map / (info_map.max() + 1e-8)
         print(f"\n=== cycle {i} ===")
-        phik = phik_from_map(info_map.flatten(), _s, k_expanded)
-        # if phik_prev is not None:
-        #     print("change in phik", torch.norm(phik - phik_prev).item())
-        # phik_prev = phik.detach()
-        phik_list.append(phik.detach()) 
-        # max_val = torch.max(info_map)
-        # jy, ix = torch.where(info_map == max_val)
-        # gx = ix.float().mean() / max(W - 1, 1)
-        # gy = jy.float().mean() / max(H - 1, 1)
-        # goal = torch.tensor([gx, gy], dtype=x0.dtype, device=x0.device)
-        # progress = i / float(N-1)
-        # lam_goal_i = lambda_goal * (0.2 + 0.8*progress)
-        # head of length tau is re-optimized each cycle
-        # draw the remaining trajectory from the current position
-        # if u_prev is None:
-        #     # full-horizon initial plan
-        #     u_optimized = optimize_trajectory(x0, phik, k, lamk, u_init = u_prev, num_iters = num_iters,
-        #                                       loss_fn = lambda u_, x0_: loss_with_goal(u_, x0_, phik, k, lamk, lam_goal_i))
-        # else:
-        #     # sliding-window on head + untouched tail
-        #     head = u_prev[:tau].clone().detach().requires_grad_()
-        #     tail = u_prev[tau:]
-        #     u_opt_seed  = optimize_trajectory(x0, phik, k, lamk, u_init = head ,num_iters = num_iters,
-        #                                       loss_fn = lambda u_, x0_: loss_with_goal(u_, x0_, phik, k, lamk, lam_goal_i))
-        #     u_optimized = torch.cat([u_opt_seed, tail], dim=0)
-        # u_prev_initial = u_prev
-        u_optimized = optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev = u_prev, tau = tau, num_iters=num_iters)
-        # check_itomp_consistency(u_prev_initial, u_optimized, T = 100, tau = tau)
-        # Time-budget the optimizer: 
-        # interrupt optimize_trajectory after a fixed number of iterations or wall-clock delta
-        # then execute the first tau steps
-        x = x0.clone()
-        executed_traj = [x]
-        for step in u_optimized:
-            x, _ = f(x ,step[:2])
-            executed_traj.append(x)
-        executed_traj = torch.stack(executed_traj).cpu().detach().numpy()
+        map_changed = (last_map is None) or (not maps_are_same(info_map, last_map))
+
+        if map_changed:
+            print("Map changed: regenerating a new 100-step trajectory from current robot state.")
+            active_phik = phik_from_map(info_map.flatten(), _s, k_expanded)
+            active_plan_u = optimize_trajectory(
+                x0, active_phik, k_expanded, lamk, hk, info_map,
+                u_prev=None, T=T, tau=tau, num_iters=num_iters
+            )
+            active_plan_states = rollout_states(x0, active_plan_u).detach()
+            active_plan_cursor = 0
+            active_plan_mode = "forward"
+            last_map = info_map.clone()
+        else:
+            print("Map unchanged: executing the next consecutive head segment from existing plan.")
+            if active_plan_u is None or active_plan_states is None:
+                active_phik = phik_from_map(info_map.flatten(), _s, k_expanded)
+                active_plan_u = optimize_trajectory(
+                    x0, active_phik, k_expanded, lamk, hk, info_map,
+                    u_prev=None, T=T, tau=tau, num_iters=num_iters
+                )
+                active_plan_states = rollout_states(x0, active_plan_u).detach()
+                active_plan_cursor = 0
+                active_plan_mode = "forward"
+            elif active_plan_cursor >= active_plan_u.shape[0]:
+                active_plan_states = torch.flip(active_plan_states, dims=[0]).detach()
+                active_plan_u = controls_from_states(active_plan_states).detach()
+                active_plan_cursor = 0
+                active_plan_mode = "reverse" if active_plan_mode == "forward" else "forward"
+                print(f"Plan exhausted: switching to {active_plan_mode} execution.")
+
+        phik_list.append(active_phik.detach())
+        full_trajectories.append(active_plan_states.cpu().detach().numpy())
+
+        steps_left = active_plan_u.shape[0] - active_plan_cursor
+        exec_len = min(tau, steps_left)
+        u_head = active_plan_u[active_plan_cursor:active_plan_cursor + exec_len]
+        active_plan_cursor += exec_len
+
+        executed_traj_t = rollout_states(x0, u_head)
+        executed_traj = executed_traj_t.cpu().detach().numpy()
         end_time = time.time()
         time_list.append(end_time - start_time)
         trajectories.append(executed_traj)
-        # for next planning step, start from the next 10 time step from the previous trajectory
-        x0 = torch.tensor(executed_traj[tau, :], dtype=torch.float32)
-        u_prev = u_optimized[tau:].clone().detach().requires_grad_()
-        # if remaining.numel()==0:
-        #     u_prev = None
-        # else:
-        #     u_prev = remaining.clone().detach().requires_grad_()
-        # print("u_prev 2", u_prev)
-        # with torch.no_grad():
-        #     lam = torch.clamp(torch.sigmoid(10 * u_optimized[:, 2]), 0.05, 1.0)
-        #     print(f"  Lam min/max/mean: {lam.min():.3f}/{lam.max():.3f}/{lam.mean():.3f}")
-
-        # assert x0.shape == torch.Size([2])
-        # assert u_prev.shape[0] == u_optimized.shape[0] - tau
-
-        # plt.figure(figsize=(3, 3))
-        # plt.imshow(phik_recon.numpy(), extent=[0, 1, 0, 1], origin='lower', cmap='viridis')
-        # plt.contourf(X.numpy(), Y.numpy(), phik_recon.numpy(), cmap='viridis')
-        # plt.scatter(executed_traj[1:, 0], executed_traj[1:, 1], s=10, c = 5 * torch.sigmoid(5 * u_optimized[:, 2]), cmap='plasma')
-        # plt.title("Information Map")
+        x0 = executed_traj_t[-1].detach()
 
         pts = executed_traj[1:, :2]
         sigma = 6.0
-        lam = torch.sigmoid(sigma * u_optimized[:, 2].detach())
-        ix = (pts[:, 0] * (W - 1)).astype(int).clip(0, W - 1)
-        iy = (pts[:, 1] * (H - 1)).astype(int).clip(0, H - 1)
-        info_vals = info_map[iy, ix]
+        if pts.shape[0] > 0:
+            lam = torch.sigmoid(sigma * u_head[:, 2].detach())
+            ix = (pts[:, 0] * (W - 1)).astype(int).clip(0, W - 1)
+            iy = (pts[:, 1] * (H - 1)).astype(int).clip(0, H - 1)
+            ix_t = torch.from_numpy(ix).long()
+            iy_t = torch.from_numpy(iy).long()
+            info_vals = info_map[iy_t, ix_t]
 
-        info_norm = (info_vals - info_vals.min()) / (info_vals.max() - info_vals.min() + 1e-8)
-        K = 25
-        score = (lam.cpu().numpy() * info_norm.cpu().numpy())
-        topk_idx = np.argpartition(score, -K)[-K:]
-        topk_idx = topk_idx[np.argsort(score[topk_idx])[::-1]]
+            info_norm = (info_vals - info_vals.min()) / (info_vals.max() - info_vals.min() + 1e-8)
+            K = min(25, pts.shape[0])
+            score = (lam.cpu().numpy() * info_norm.cpu().numpy())
+            topk_idx = np.argpartition(score, -K)[-K:]
+            topk_idx = topk_idx[np.argsort(score[topk_idx])[::-1]]
+        else:
+            topk_idx = np.array([], dtype=np.int64)
         k_idx.append(topk_idx)
 
-    return trajectories, k_idx, phik_list, time_list
+    return trajectories, full_trajectories, k_idx, phik_list, time_list
 
 def get_files_in_folder(path):
     files = []
@@ -394,10 +408,27 @@ for file in (get_files_in_folder(entropy_maps_path)):
 #     if gaussian_file != None:
 #         gaussian_maps.append(gaussian_file)
 
-# Randomly select n number of maps for testing
+# Build map sequence for testing
 full_maps = torch.stack(entropy_maps)
+n_cycles = 4
+
+# Option A: every cycle uses a NEW map (no immediate repeats).
+# Uncomment this block to use all-new maps.
 perm = torch.randperm(full_maps.shape[0])
-maps = full_maps[perm[:4]]
+maps = full_maps[perm[:n_cycles]]
+
+# Option B: current map may be SAME as previous map for some cycles.
+# Uncomment this block (and comment Option A) to inject repeats.
+# repeat_prob = 0.5  # probability to reuse previous map
+# perm = torch.randperm(full_maps.shape[0])
+# seed_pool = full_maps[perm[:n_cycles]]
+# maps_list = [seed_pool[0]]
+# for i in range(1, n_cycles):
+#     if random.random() < repeat_prob:
+#         maps_list.append(maps_list[-1].clone())
+#     else:
+#         maps_list.append(seed_pool[i])
+# maps = torch.stack(maps_list, dim=0)
 
 # Sample grid of (0 to 1) to match the resolution
 N, H, W = maps.shape
@@ -429,7 +460,7 @@ k_expanded = k.unsqueeze(0)
 fk_vals_all = torch.cos(_s[:, None, :] * k_expanded).prod(dim=-1)
 
 
-trajectory, k_idx, phik_list, time_list = replanning(maps, _s, k_expanded, lamk)
+trajectory, full_trajectory, k_idx, phik_list, time_list = replanning(maps, _s, k_expanded, lamk)
 
 
 print(f"Execution time: {time_list}")
@@ -444,6 +475,7 @@ axes = axes.ravel()
 
 for i in range(num_cycles):
     tr = trajectory[i]
+    full_tr = full_trajectory[i]
     pts_i = tr[1:, :2]
     topk = k_idx[i] 
     phik = phik_list[i]    
@@ -451,14 +483,15 @@ for i in range(num_cycles):
     phik_recon = torch.matmul(fk_vals_all, phik).reshape(H, W)
     ax = axes[i]
 
-    tau = 30
     ax.imshow(phik_recon, extent=[0, 1, 0, 1], origin='lower', cmap='viridis')
     ax.contourf(X.numpy(), Y.numpy(), phik_recon, cmap='viridis')
-    ax.scatter(tr[1:tau, 0], tr[1:tau, 1], s=5, c='white')
-    ax.scatter(tr[tau:, 0], tr[tau:, 1], s=5, c='red')
-    ax.scatter(pts_i[topk, 0], pts_i[topk, 1], s=15, c='cyan')
+    ax.scatter(full_tr[1:, 0], full_tr[1:, 1], s=8, c='white', alpha=0.5)
+    ax.scatter(tr[1:, 0], tr[1:, 1], s=10, c='white')
+    if len(topk) > 0:
+        ax.scatter(pts_i[topk, 0], pts_i[topk, 1], s=18, c='red')
     ax.scatter(tr[0, 0], tr[0, 1], c='w', s=50, marker='X')
-    ax.set_title(f"Trajectory {i + 1}")
+    ax.scatter(tr[-1, 0], tr[-1, 1], c='yellow', s=30)
+    ax.set_title(f"Cycle {i + 1} (20-step head)")
     ax.set_aspect('equal')
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
