@@ -25,10 +25,11 @@ SENSOR_ON_HIGH_W = -0.18
 SENSOR_ON_LOW_W = 0.14
 SENSOR_BIN_W = 0.02
 SENSOR_TRACK_W = 0.35
-COVERAGE_W = 0.40
-HEAD_GOAL_W = 6.0
+# Top-ranked values from tuning_ranked_results.csv (combo_idx=12).
+COVERAGE_W = 0.55
+HEAD_GOAL_W = 5.0
 TERMINAL_GOAL_W = 0.90
-GOAL_DISTANCE_WEIGHT = 0.75
+GOAL_DISTANCE_WEIGHT = 0.70
 
 # # Dynamics and target distribution
 # # The dynamics are defined as the constrained continuous time dynamical system
@@ -778,10 +779,6 @@ for file in (get_files_in_folder(entropy_maps_path)):
 full_maps = torch.stack(entropy_maps)
 n_cycles = 4
 
-# Fixed seeds for reproducible tuning comparisons.
-torch.manual_seed(7)
-np.random.seed(7)
-random.seed(7)
 
 # ===========================================================================
 # Option A: every cycle uses a NEW map (no immediate repeats).
