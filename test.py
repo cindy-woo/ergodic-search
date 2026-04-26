@@ -7,29 +7,32 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.colors import LinearSegmentedColormap
-import random
 import time
 
-SENSOR_ON_THRESHOLD = 0.65
+SENSOR_ON_THRESHOLD = 0.60
 HIGH_INFO_QUANTILE = 0.70
 LOW_SPEED_THRESHOLD = 0.015
 HOTSPOT_QUANTILE = 0.86
-MAX_HOTSPOTS = 6
+MAX_HOTSPOTS = 5
 
-# Behavioral shaping weights (kept modest so ergodic coverage remains primary).
-INFO_REWARD_W = -0.10
-PATH_INFO_REWARD_W = -0.28
-DWELL_W = 0.10
-TRANSIT_W = 0.08
-SENSOR_ON_HIGH_W = -0.18
-SENSOR_ON_LOW_W = 0.14
-SENSOR_BIN_W = 0.02
-SENSOR_TRACK_W = 0.35
-# Top-ranked values from tuning_ranked_results.csv (combo_idx=12).
-COVERAGE_W = 0.55
-HEAD_GOAL_W = 5.0
-TERMINAL_GOAL_W = 0.90
-GOAL_DISTANCE_WEIGHT = 0.70
+# Core planner weights (kept intentionally small in count).
+TEMPORAL_DISCOUNT = 0.35
+ORDER_WEIGHTS = (3.0, 2.0, 1.2)
+HEAD_GOAL_W = 12.0
+TERMINAL_GOAL_W = 1.0
+COVERAGE_W = 0.35
+INFO_CLUSTER_W = 0.70
+SPEED_W = 0.60
+DIRECTNESS_W = 0.35
+TURN_W = 0.06
+SENSOR_BCE_W = 1.50
+SENSOR_OFF_W = 0.40
+SENSOR_SMOOTH_W = 0.06
+V_HIGH = 0.008
+V_LOW = 0.060
+SPLIT_VEL_W = 3.0
+SPLIT_ACC_W = 1.2
+SPLIT_LAM_W = 1.0
 
 # # Dynamics and target distribution
 # # The dynamics are defined as the constrained continuous time dynamical system
@@ -134,24 +137,82 @@ def choose_priority_goals(info_map, x0, hotspot_quantile=HOTSPOT_QUANTILE, max_h
         max_hotspots=max_hotspots,
         hotspot_quantile=hotspot_quantile,
     )
-    start_xy = x0[:2]
-    dists = torch.norm(hotspots - start_xy.unsqueeze(0), dim=1)
-    # Prefer high information while still favoring the closer hotspot for the first head.
-    rank_score = hotspot_scores - GOAL_DISTANCE_WEIGHT * dists
-    head_idx = int(torch.argmax(rank_score).item())
-    head_goal = hotspots[head_idx]
 
-    if hotspots.shape[0] > 1:
-        keep = torch.ones(hotspots.shape[0], dtype=torch.bool, device=hotspots.device)
-        keep[head_idx] = False
-        rem_hotspots = hotspots[keep]
-        rem_scores = hotspot_scores[keep]
-        w = rem_scores / (rem_scores.sum() + 1e-8)
-        terminal_goal = torch.sum(rem_hotspots * w.unsqueeze(1), dim=0)
+    # Ensure we can always build h1 -> h2 -> h3.
+    while hotspots.shape[0] < 3:
+        hotspots = torch.cat([hotspots, hotspots[:1]], dim=0)
+        hotspot_scores = torch.cat([hotspot_scores, hotspot_scores[:1]], dim=0)
+
+    # h1: closest strong hotspot from current robot position.
+    start_xy = x0[:2].to(device=hotspots.device, dtype=torch.float32)
+    d_start = torch.norm(hotspots - start_xy.unsqueeze(0), dim=1)
+    h1_score = hotspot_scores - 0.75 * d_start
+    h1_idx = int(torch.argmax(h1_score).item())
+
+    ordered_ids = [h1_idx]
+    remaining_ids = [idx for idx in range(hotspots.shape[0]) if idx != h1_idx]
+    prev_idx = h1_idx
+
+    # h2/h3: greedy continuation while preferring informative peaks.
+    for _ in range(2):
+        if not remaining_ids:
+            ordered_ids.append(prev_idx)
+            continue
+        rem = torch.tensor(remaining_ids, dtype=torch.long, device=hotspots.device)
+        d_prev = torch.norm(hotspots[rem] - hotspots[prev_idx].unsqueeze(0), dim=1)
+        score_next = hotspot_scores[rem] - 0.55 * d_prev
+        pick = int(rem[torch.argmax(score_next)].item())
+        ordered_ids.append(pick)
+        remaining_ids.remove(pick)
+        prev_idx = pick
+
+    ordered_goals = hotspots[torch.tensor(ordered_ids[:3], dtype=torch.long, device=hotspots.device)]
+
+    # Keep a small coverage set to avoid "visit everything" loops.
+    top_k = min(4, hotspots.shape[0])
+    top_ids = torch.argsort(hotspot_scores, descending=True)[:top_k]
+    coverage_hotspots = hotspots[top_ids]
+    return ordered_goals, coverage_hotspots
+
+def compute_split_jump_metric(u, tau):
+    T = u.shape[0]
+    if T < 2:
+        return {
+            "split_jump_metric": 0.0,
+            "split_vel_jump": 0.0,
+            "split_acc_jump": 0.0,
+            "split_lam_jump": 0.0,
+        }
+    tau_i = int(min(max(tau, 1), T - 1))
+    lam = compute_sensor_lambda(u)
+    vel_jump = torch.norm(u[tau_i - 1, :2] - u[tau_i, :2]).item()
+    lam_jump = torch.abs(lam[tau_i - 1] - lam[tau_i]).item()
+    if tau_i + 1 < T:
+        acc_jump = torch.norm(u[tau_i + 1, :2] - 2.0 * u[tau_i, :2] + u[tau_i - 1, :2]).item()
     else:
-        terminal_goal = head_goal.clone()
+        acc_jump = 0.0
+    split_jump = float(vel_jump + 0.5 * acc_jump + lam_jump)
+    return {
+        "split_jump_metric": split_jump,
+        "split_vel_jump": float(vel_jump),
+        "split_acc_jump": float(acc_jump),
+        "split_lam_jump": float(lam_jump),
+    }
 
-    return head_goal, terminal_goal, hotspots
+def compute_hotspot_distance_metrics(states, ordered_goals, tau):
+    pts = states[1:, :2]
+    if pts.shape[0] == 0:
+        return {"head_dist_h1_at_tau": 0.0, "mean_hotspot_coverage_dist": 0.0}
+    tau_idx = int(min(max(tau, 1), pts.shape[0])) - 1
+    head_dist = torch.norm(pts[tau_idx] - ordered_goals[0]).item()
+    cover_dists = []
+    for goal in ordered_goals:
+        d = torch.norm(pts - goal.unsqueeze(0), dim=1)
+        cover_dists.append(torch.min(d).item())
+    return {
+        "head_dist_h1_at_tau": float(head_dist),
+        "mean_hotspot_coverage_dist": float(np.mean(cover_dists)),
+    }
 
 def compute_behavior_metrics(
     executed_traj_t,
@@ -164,9 +225,12 @@ def compute_behavior_metrics(
     if u_head.shape[0] == 0:
         return {
             "high_info_dwell_ratio": 0.0,
+            "high_info_dwell_area_norm": 0.0,
             "low_info_transit_efficiency": 0.0,
+            "low_info_idle_rate": 0.0,
             "sensor_precision": 0.0,
             "sensor_recall": 0.0,
+            "sensor_f1_high_info": 0.0,
             "avg_speed_high_info": 0.0,
             "avg_speed_low_info": 0.0,
         }
@@ -187,10 +251,13 @@ def compute_behavior_metrics(
 
     precision = tp / max(pred_on, 1)
     recall = tp / max(actual_high, 1)
+    f1 = (2.0 * precision * recall) / max((precision + recall), 1e-8)
 
     dwell_ratio = high_mask.float().mean().item()
     low_idle_rate = ((speed < low_speed_threshold) & low_mask).float().sum().item() / max(low_mask.sum().item(), 1)
     transit_eff = 1.0 - low_idle_rate
+    map_high_area = (info_map >= high_thr).float().mean().item()
+    dwell_area_norm = dwell_ratio / max(map_high_area, 1e-6)
 
     if high_mask.any():
         avg_speed_high = speed[high_mask].mean().item()
@@ -203,9 +270,12 @@ def compute_behavior_metrics(
 
     return {
         "high_info_dwell_ratio": float(dwell_ratio),
+        "high_info_dwell_area_norm": float(dwell_area_norm),
         "low_info_transit_efficiency": float(transit_eff),
+        "low_info_idle_rate": float(low_idle_rate),
         "sensor_precision": float(precision),
         "sensor_recall": float(recall),
+        "sensor_f1_high_info": float(f1),
         "avg_speed_high_info": float(avg_speed_high),
         "avg_speed_low_info": float(avg_speed_low),
     }
@@ -228,6 +298,10 @@ def fourier_ergodic_loss(
     head_w=1.0,
     tail_w=0.25,
     hotspots=None,
+    ordered_goals=None,
+    split_vel_w=SPLIT_VEL_W,
+    split_acc_w=SPLIT_ACC_W,
+    split_lam_w=SPLIT_LAM_W,
 ):
     displacements = 0.07 * u[:, :2]
     tr = torch.cumsum(displacements, dim=0) + x0
@@ -236,64 +310,109 @@ def fourier_ergodic_loss(
     T = u.shape[0]
     lam = compute_sensor_lambda(u)
 
-    # determine the weights of head and tail for the amount of contributions to the trajectory
+    # Head/tail weighting over one horizon (execution only uses the head).
     w = torch.ones(T, device=u.device)
     if tau is not None:
         w[:tau] = head_w
         w[tau:] = tail_w
 
-    # add exponetial discount
-    # Lower discount aggressiveness keeps more tail influence for global coverage.
-    disc = torch.exp(-1.0 * torch.arange(T, device=u.device, dtype=torch.float32) / T)
+    # Mild temporal discount so the tail still matters.
+    disc = torch.exp(-TEMPORAL_DISCOUNT * torch.arange(T, device=u.device, dtype=torch.float32) / T)
     w = w * disc
 
-    ck = get_ck_weighted(tr[:, :2], k_expanded, lam * w, hk)
+    # Keep trajectory optimization independent from sensor noise/randomness.
+    ck = get_ck_weighted(tr[:, :2], k_expanded, w, hk)
 
     phik_normed = (phik - phik.mean()) / (phik.std() + 1e-6)
     ck_normed   = (ck   - ck.mean())   / (ck.std()   + 1e-6)
+    ergodic_term = torch.sum(lamk * (phik_normed - ck_normed)**2)
 
     info_map_norm = normalize_info_map(info_map)
     info_norm, _, _ = sample_info_values(tr[:, :2], info_map_norm)
     speed = torch.norm(displacements, dim=1)
-    low_speed_gap = torch.clamp_min(LOW_SPEED_THRESHOLD - speed, 0.0)
 
-    # -----------------------------------------------------------------------
-    # Behavioral shaping terms
-    # -----------------------------------------------------------------------
-    # High-info attraction with and without sensor gating.
-    reward_term = INFO_REWARD_W * torch.sum(w * lam * info_norm.pow(3))
-    path_info_term = PATH_INFO_REWARD_W * torch.sum(w * info_norm.pow(2))
-    # Spend more time in high-info regions (discourage high speed there).
-    dwell_term = DWELL_W * torch.sum(w * info_norm * speed)
-    # Move quickly through low-info regions (penalize slow motion there).
-    transit_term = TRANSIT_W * torch.sum(w * (1.0 - info_norm) * low_speed_gap)
-    # Sensor precision: ON in high-info, OFF in low-info, mildly binary decisions.
-    sensor_on_high = SENSOR_ON_HIGH_W * torch.sum(w * lam * info_norm)
-    sensor_on_low = SENSOR_ON_LOW_W * torch.sum(w * lam * (1.0 - info_norm))
-    sensor_binary = SENSOR_BIN_W * torch.sum(w * lam * (1.0 - lam))
-    sensor_track = SENSOR_TRACK_W * torch.sum(w * (lam - info_norm.pow(1.5)).pow(2))
+    # Dwell in high info, move faster through low info.
+    info_cluster_term = -INFO_CLUSTER_W * torch.mean(info_norm.pow(2))
+    v_target = V_HIGH + (1.0 - info_norm) * (V_LOW - V_HIGH)
+    speed_term = SPEED_W * torch.mean((speed - v_target).pow(2))
+    directness_term = DIRECTNESS_W * torch.mean(speed * (1.0 - info_norm).pow(2))
+
+    if displacements.shape[0] > 1:
+        turn_term = TURN_W * torch.mean(torch.sum((displacements[1:] - displacements[:-1]).pow(2), dim=1))
+    else:
+        turn_term = 0.0
+
+    # Sensor policy: ON in high info, OFF in low info.
+    q70 = torch.quantile(info_map_norm.flatten(), HIGH_INFO_QUANTILE)
+    target_lam = torch.sigmoid((info_norm - q70) / 0.05)
+    eps = 1e-6
+    sensor_bce = -(
+        2.5 * target_lam * torch.log(lam + eps)
+        + (1.0 - target_lam) * torch.log(1.0 - lam + eps)
+    )
+    sensor_bce_term = SENSOR_BCE_W * torch.mean(sensor_bce)
+    sensor_off_term = SENSOR_OFF_W * torch.mean(lam * (1.0 - target_lam))
+    if lam.shape[0] > 1:
+        sensor_smooth_term = SENSOR_SMOOTH_W * torch.mean((lam[1:] - lam[:-1]).pow(2))
+    else:
+        sensor_smooth_term = 0.0
+
+    # Soft ordered visits with monotonic progress to reduce detours.
+    ordered_term = 0.0
+    if ordered_goals is not None and ordered_goals.shape[0] >= 3:
+        t1 = int(min(max(tau if tau is not None else T // 5, 1), T))
+        t2 = int(min(max(t1 + 40, t1 + 1), T))
+        segments = (
+            (0, t1, ordered_goals[0]),
+            (t1, t2, ordered_goals[1]),
+            (t2, T, ordered_goals[2]),
+        )
+        beta = 25.0
+        for j, (s0, s1, goal) in enumerate(segments):
+            if s1 <= s0:
+                continue
+            seg = tr[s0:s1, :2]
+            if seg.shape[0] == 0:
+                continue
+            d = torch.norm(seg - goal.unsqueeze(0), dim=1)
+            d2 = d.pow(2)
+            soft_min = -torch.logsumexp(-beta * d2, dim=0) / beta
+            progress_penalty = torch.relu(d[1:] - d[:-1]).mean() if d.shape[0] > 1 else 0.0
+            seg_w = ORDER_WEIGHTS[min(j, len(ORDER_WEIGHTS) - 1)]
+            ordered_term = ordered_term + seg_w * (soft_min + 0.6 * progress_penalty)
+
     coverage_term = 0.0
     if hotspots is not None and hotspots.numel() > 0:
         dist2 = torch.sum((tr[:, None, :2] - hotspots[None, :, :])**2, dim=2)
-        smooth_min = -torch.logsumexp(-25.0 * dist2, dim=0) / 25.0
+        smooth_min = -torch.logsumexp(-20.0 * dist2, dim=0) / 20.0
         coverage_term = COVERAGE_W * torch.mean(smooth_min)
 
-    # control energy + smoothness + state barrier + lambda sparsity + lambda barrier + reward
-    loss = torch.sum(lamk * (phik_normed - ck_normed)**2) \
-            + 0.001 * torch.mean(u[:, :2]**2) \
-            + 0.001 * torch.sum((u[1:, :2] - u[:-1, :2])**2) \
-            + 10 * torch.sum(torch.clamp_min(tr - 1, 0)**2 + torch.clamp_min(-tr, 0)**2) \
-            + 0.000005 * torch.sum(torch.abs(lam)) \
-            + 10 * torch.sum(torch.clamp_min(lam - 1, 0)**2 + torch.clamp_min(-lam, 0)**2) \
-            + reward_term \
-            + path_info_term \
-            + dwell_term \
-            + transit_term \
-            + sensor_on_high \
-            + sensor_on_low \
-            + sensor_binary \
-            + sensor_track \
-            + coverage_term
+    # Head/tail split smoothness penalties.
+    split_vel_term = 0.0
+    split_acc_term = 0.0
+    split_lam_term = 0.0
+    if tau is not None and T >= 2:
+        tau_i = int(min(max(tau, 1), T - 1))
+        split_vel_term = split_vel_w * torch.sum((u[tau_i - 1, :2] - u[tau_i, :2])**2)
+        split_lam_term = split_lam_w * (lam[tau_i - 1] - lam[tau_i]).pow(2)
+        if tau_i + 1 < T:
+            split_acc_term = split_acc_w * torch.sum((u[tau_i + 1, :2] - 2.0 * u[tau_i, :2] + u[tau_i - 1, :2])**2)
+
+    loss = ergodic_term \
+            + 0.0005 * torch.mean(u[:, :2].pow(2)) \
+            + 0.0008 * torch.mean((u[1:, :2] - u[:-1, :2]).pow(2)) \
+            + info_cluster_term \
+            + speed_term \
+            + directness_term \
+            + turn_term \
+            + sensor_bce_term \
+            + sensor_off_term \
+            + sensor_smooth_term \
+            + ordered_term \
+            + coverage_term \
+            + split_vel_term \
+            + split_acc_term \
+            + split_lam_term
     return loss
 
 # -----------------------------------------------------------------------
@@ -314,69 +433,74 @@ def optimize_trajectory(
     patience=25,
     rel_improve_tol=1e-4,
     lr=1e-3,
+    bridge_len=24,
+    xy_noise_std=0.0015,
+    split_vel_w=SPLIT_VEL_W,
+    split_acc_w=SPLIT_ACC_W,
+    split_lam_w=SPLIT_LAM_W,
     return_diagnostics=False,
+    return_debug_metrics=True,
 ):
-    # u = torch.empty((T, 3), dtype=torch.float32)
-    # u[:, :2].normal_(mean=0.0, std=0.01)
-    # u[:, 2].uniform_(-0.5, 0.5)
-    # u.requires_grad_()
-
-    # If u_prev exists, warm-start from that. If not, random-init. Normally, only the inital trajectory will be None
-    # if u_prev is None:
-    #     u = torch.empty((T, 3), dtype=torch.float32)
-    #     u[:, :2].normal_(mean=0.0, std=0.01)
-    #     u[:, 2].uniform_(-0.5, 0.5)
-    #     u.requires_grad_()
-    #     print("u for None", u.shape)
-    # else:
-    #     # u_prev is u from the previous trajectory, starting from the defined time step
-    #     tau = 9
-    #     u_add = torch.empty((tau, 3), dtype=torch.float32)
-    #     u_add[:, :2].normal_(mean=0.0, std=0.01)
-    #     u_add[:, 2].uniform_(-0.5, 0.5)
-    #     u = torch.cat([u_prev, u_add], dim = 0)
-    #     u = u.clone().detach().requires_grad_()
-    #     print("u for else", u.shape)
-    
     tau = int(min(max(tau, 1), T))
+    bridge_len = int(max(0, bridge_len))
+    opt_window = T if u_prev is None else min(T, tau + bridge_len)
 
-    # Initial call (no previous trajectory): optimize over full horizon but keep head/tail shaping.
+    with torch.no_grad():
+        ordered_goals, hotspots = choose_priority_goals(info_map, x0)
+    ordered_goals = ordered_goals.to(device=x0.device, dtype=torch.float32)
+    hotspots = hotspots.to(device=x0.device, dtype=torch.float32)
+    head_goal = ordered_goals[0]
+    mid_goal = ordered_goals[1]
+    terminal_goal = ordered_goals[2]
+
+    # Full-horizon optimize for initial call.
     if u_prev is None:
-        head = torch.empty((T, 3), device=x0.device, dtype=torch.float32)
-        # -----------------------------------------------------------------------
-        # TUNING PARAMETER
-        # initial noise std
-        head[:, :2].normal_(mean=0.0, std=0.01)
-        head[:, 2].uniform_(-0.5, 0.5)
+        head = torch.empty((opt_window, 3), device=x0.device, dtype=torch.float32)
+        head.zero_()
+
+        # Goal-guided seed to reduce detours and prioritize h1 -> h2 -> h3 ordering.
+        seg1 = int(min(tau, opt_window))
+        rem = int(max(opt_window - seg1, 0))
+        seg2 = rem // 2
+        seg3 = rem - seg2
+        if seg1 > 0:
+            ctrl1 = ((head_goal - x0) / (0.07 * seg1)).clamp(min=-1.0, max=1.0)
+            head[:seg1, :2] = ctrl1
+        if seg2 > 0:
+            ctrl2 = ((mid_goal - head_goal) / (0.07 * seg2)).clamp(min=-1.0, max=1.0)
+            head[seg1:seg1 + seg2, :2] = ctrl2
+        if seg3 > 0:
+            ctrl3 = ((terminal_goal - mid_goal) / (0.07 * seg3)).clamp(min=-1.0, max=1.0)
+            head[seg1 + seg2:, :2] = ctrl3
+        head[:, :2] += 0.002 * torch.randn_like(head[:, :2])
+
+        # Sensor seed from expected map intensity along the seeded path.
+        rough_tr = torch.cumsum(0.07 * head[:, :2], dim=0) + x0
+        rough_tr = rough_tr.clamp(0.0, 1.0)
+        info_map_norm = normalize_info_map(info_map)
+        rough_info, _, _ = sample_info_values(rough_tr, info_map_norm)
+        q_hi = torch.quantile(info_map_norm.flatten(), HIGH_INFO_QUANTILE)
+        lam_target = torch.sigmoid((rough_info - q_hi) / 0.055).clamp(1e-4, 1.0 - 1e-4)
+        head[:, 2] = torch.log(lam_target / (1.0 - lam_target)) / 5.0
         tail = None
         loss_tau = tau
     else:
-        # Warm start from previous controls; optimize only the head segment.
+        # Warm-start with head+bridge optimize window.
         u_seed = u_prev.detach().to(device=x0.device, dtype=torch.float32)
         if u_seed.shape[0] >= T:
             u_seed = u_seed[:T]
         else:
-            pad = torch.empty((T - u_seed.shape[0], 3), device=x0.device, dtype=torch.float32)
-            # -----------------------------------------------------------------------
-            # TUNING PARAMETER
-            # initial noise std 0.01
-            pad[:, :2].normal_(mean=0.0, std=0.01)
-            pad[:, 2].uniform_(-0.5, 0.5)
+            pad = u_seed[-1:, :].repeat(T - u_seed.shape[0], 1)
             u_seed = torch.cat([u_seed, pad], dim=0)
 
-        head = u_seed[:tau].clone()
-        head[:, 2].zero_()
-        # -----------------------------------------------------------------------
-        # TUNING PARAMETER
-        # random noise, 0.01, added to the head when warm-starting from a previous plan
-        # encourages the robot to explore slightly different paths
-        head += 0.01 * torch.randn_like(head)
-        tail = u_seed[tau:].clone().detach()
+        head = u_seed[:opt_window].clone()
+        if xy_noise_std > 0:
+            warm_len = min(tau, head.shape[0])
+            head[:warm_len, :2] += xy_noise_std * torch.randn_like(head[:warm_len, :2])
+        tail = u_seed[opt_window:].clone().detach()
         loss_tau = tau
     head = torch.nn.Parameter(head)
 
-    # LBFGS optimize
-    # optimizer = torch.optim.LBFGS([head], lr=lr, max_iter=20, history_size=10)
     optimizer = torch.optim.Adam([head], lr=lr)
     def u_builder(head, tail):
         if tail is None:
@@ -385,8 +509,7 @@ def optimize_trajectory(
             return torch.cat([head, tail], dim = 0)
 
     u_for_eval = u_builder(head, tail)
-    with torch.no_grad():
-        head_goal, terminal_goal, hotspots = choose_priority_goals(info_map, x0)
+    ordered_goals = ordered_goals.to(device=u_for_eval.device, dtype=torch.float32)
     head_goal = head_goal.to(device=u_for_eval.device, dtype=torch.float32)
     terminal_goal = terminal_goal.to(device=u_for_eval.device, dtype=torch.float32)
     hotspots = hotspots.to(device=u_for_eval.device, dtype=torch.float32)
@@ -395,10 +518,14 @@ def optimize_trajectory(
         initial_loss = float(
             loss_with_goal(
                 u_for_eval, x0, phik, k_expanded, lamk, hk, info_map,
-                tau=loss_tau, head_w=1.0, tail_w=0.75,
+                tau=loss_tau, head_w=1.0, tail_w=0.80,
                 goal=terminal_goal, goal_w=TERMINAL_GOAL_W,
                 head_goal=head_goal, head_goal_w=HEAD_GOAL_W,
-                hotspots=hotspots
+                hotspots=hotspots,
+                ordered_goals=ordered_goals,
+                split_vel_w=split_vel_w,
+                split_acc_w=split_acc_w,
+                split_lam_w=split_lam_w,
             ).item()
         )
 
@@ -406,45 +533,25 @@ def optimize_trajectory(
     plateau_count = 0
     iterations_run = 0
 
-    # Optimization loop
     for i in range(max_iters):
-        # def closure():
-        #     optimizer.zero_grad()
-        #     u = u_builder(head, tail)
-        #     max_val = torch.max(info_map)
-        #     jy, ix = torch.where(info_map == max_val)
-        #     gx = ix.float().mean() / max(W - 1, 1) 
-        #     gy = jy.float().mean() / max(H - 1, 1)
-        #     goal = torch.tensor([gx, gy], dtype=torch.float32, device=u.device)
-        #     loss = loss_with_goal(u, x0, phik, k_expanded, lamk, hk, info_map, tau=tau, head_w=1.0, tail_w=0.10, goal = goal, goal_w = 2.5)
-        #     loss.backward()
-        #     assert head.grad is not None and head.grad.abs().mean().item() > 0, "Head not receiving gradients."
-        #     assert not (tail is not None and tail.requires_grad), "Tail should be frozen."
-        #     torch.nn.utils.clip_grad_norm_([head], max_norm=0.1)
-        #     return loss
-        
-        # if (i+1) % 100 == 0:
-        #     if not torch.isfinite(loss).all().item():
-        #         print("Warning: non-finite loss encountered.")
-        # loss = optimizer.step(closure)
         optimizer.zero_grad()
-        # Reconstruct the full control sequence from the head and tail segments
         u = u_builder(head, tail)
-        # Compute the loss with the current control sequence
         loss = loss_with_goal(
             u, x0, phik, k_expanded, lamk, hk, info_map,
-            tau=loss_tau, head_w=1.0, tail_w=0.75,
+            tau=loss_tau, head_w=1.0, tail_w=0.80,
             goal=terminal_goal, goal_w=TERMINAL_GOAL_W,
             head_goal=head_goal, head_goal_w=HEAD_GOAL_W,
-            hotspots=hotspots
+            hotspots=hotspots,
+            ordered_goals=ordered_goals,
+            split_vel_w=split_vel_w,
+            split_acc_w=split_acc_w,
+            split_lam_w=split_lam_w,
         )
-        # Compute the gradients of the loss w.r.t. the head controls
         loss.backward()
-        # Update the head parameter using the optimizer
         optimizer.step()
         with torch.no_grad():
-                head[:, :2].clamp_(min = -1.0, max = 1.0)
-                head[:, 2].clamp_(min = -1.0, max = 1.0)
+            head[:, :2].clamp_(min=-1.0, max=1.0)
+            head[:, 2].clamp_(min=-1.0, max=1.0)
         curr_loss = float(loss.item())
         rel_improve = (last_loss - curr_loss) / (abs(last_loss) + 1e-8)
         if rel_improve < rel_improve_tol:
@@ -460,14 +567,7 @@ def optimize_trajectory(
 
         if (i+1) % 20 == 0:
             print(f"Iteration {i+1}, Loss: {loss.item()}")
-            # xf = x0.clone()
-            # tr = [xf]
-            # for step in u.detach():
-            #     xf, _ = f(xf, step)
-            #     tr.append(xf)
-            # tr = torch.stack(tr).numpy()
-            # plt.scatter(tr[:-1, 0], tr[:-1, 1], c=u.detach()[:, 2].numpy(), cmap='plasma')
-            # plt.show()
+
     u = u_builder(head, tail).detach()
     if u.shape[0] != T:
         if u.shape[0] > T:
@@ -476,6 +576,22 @@ def optimize_trajectory(
             padding = torch.zeros((T - u.shape[0], 3), device=u.device, dtype=torch.float32)
             padding[:, :] = u[-1, :].detach()
             u = torch.cat([u, padding], dim=0)
+
+    debug = {}
+    if return_debug_metrics:
+        split_debug = compute_split_jump_metric(u, tau)
+        states = rollout_states(x0, u)
+        hotspot_debug = compute_hotspot_distance_metrics(states, ordered_goals, tau)
+        behavior_debug = compute_behavior_metrics(states, u, info_map)
+        debug.update(split_debug)
+        debug.update(hotspot_debug)
+        debug.update({
+            "plan_dwell_ratio": behavior_debug["high_info_dwell_ratio"],
+            "plan_dwell_area_norm": behavior_debug["high_info_dwell_area_norm"],
+            "plan_low_idle_rate": behavior_debug["low_info_idle_rate"],
+            "plan_sensor_f1_high_info": behavior_debug["sensor_f1_high_info"],
+        })
+
     diagnostics = {
         "initial_loss": initial_loss,
         "final_loss": float(last_loss),
@@ -483,22 +599,14 @@ def optimize_trajectory(
         "early_stopped": bool(iterations_run < max_iters),
         "loss_tau": int(loss_tau),
         "used_warm_start": bool(u_prev is not None),
+        "opt_window": int(opt_window),
+        "bridge_len": int(bridge_len),
     }
+    diagnostics.update(debug)
 
     if return_diagnostics:
         return u, diagnostics
     return u
-
-def check_itomp_consistency(u_prev, u_opt, T = 100, tau = 9):
-    target_len = max(0, T - tau)
-    if u_prev is None:
-        return  # first cycle
-
-    copied = u_opt[tau:tau+target_len]
-    want   = u_prev[:target_len].detach()
-    if not torch.allclose(copied, want, atol=1e-5, rtol=1e-5):
-        print("Tail mismatch with previous u_prev[:T-tau]")
-        print("copied - want", torch.norm(copied - want).item())
 
 # compute phik from the information map
 # input phik_map flattens values from the most recent information map from sample value, _s
@@ -523,10 +631,21 @@ def loss_with_goal(
     head_goal=None,
     head_goal_w=0.0,
     hotspots=None,
+    ordered_goals=None,
+    split_vel_w=SPLIT_VEL_W,
+    split_acc_w=SPLIT_ACC_W,
+    split_lam_w=SPLIT_LAM_W,
 ):
     lambda_erg = fourier_ergodic_loss(
         u, x0, phik, k_expanded, lamk, hk, info_map,
-        tau=tau, head_w=head_w, tail_w=tail_w, hotspots=hotspots
+        tau=tau,
+        head_w=head_w,
+        tail_w=tail_w,
+        hotspots=hotspots,
+        ordered_goals=ordered_goals,
+        split_vel_w=split_vel_w,
+        split_acc_w=split_acc_w,
+        split_lam_w=split_lam_w,
     )
     # rollout trajectory to get final state x_T
     x = x0.clone()
@@ -596,7 +715,6 @@ def replanning(
 ):
     x_init = torch.tensor([0.54, 0.3], dtype=torch.float32)
     x0 = x_init.clone()
-    N, H, W = maps.shape
     trajectories, phik_list = [], []
     full_trajectories = []
     full_lambda_list = []
@@ -643,6 +761,12 @@ def replanning(
             "iterations_run": 0,
             "early_stopped": False,
             "used_warm_start": False,
+            "head_dist_h1_at_tau": 0.0,
+            "mean_hotspot_coverage_dist": 0.0,
+            "split_jump_metric": 0.0,
+            "split_vel_jump": 0.0,
+            "split_acc_jump": 0.0,
+            "split_lam_jump": 0.0,
         }
 
         # No optimization when map is unchanged and we already have a plan.
@@ -726,11 +850,20 @@ def replanning(
             "rel_improve_warm": rel_improve_warm,
             "cycle_time_sec": float(cycle_time),
             "high_info_dwell_ratio": behavior["high_info_dwell_ratio"],
+            "high_info_dwell_area_norm": behavior["high_info_dwell_area_norm"],
             "low_info_transit_efficiency": behavior["low_info_transit_efficiency"],
+            "low_info_idle_rate": behavior["low_info_idle_rate"],
             "sensor_precision": behavior["sensor_precision"],
             "sensor_recall": behavior["sensor_recall"],
+            "sensor_f1_high_info": behavior["sensor_f1_high_info"],
             "avg_speed_high_info": behavior["avg_speed_high_info"],
             "avg_speed_low_info": behavior["avg_speed_low_info"],
+            "head_dist_h1_at_tau": float(opt_diag.get("head_dist_h1_at_tau", 0.0)),
+            "mean_hotspot_coverage_dist": float(opt_diag.get("mean_hotspot_coverage_dist", 0.0)),
+            "split_jump_metric": float(opt_diag.get("split_jump_metric", 0.0)),
+            "split_vel_jump": float(opt_diag.get("split_vel_jump", 0.0)),
+            "split_acc_jump": float(opt_diag.get("split_acc_jump", 0.0)),
+            "split_lam_jump": float(opt_diag.get("split_lam_jump", 0.0)),
         })
 
     return trajectories, full_trajectories, full_lambda_list, head_len_list, phik_list, time_list, diagnostics
@@ -753,8 +886,6 @@ def load_files(file):
         return None
     return torch.from_numpy(arr).float()
 
-
-
 # Compute the Fourier basis modes and the orthonormalization factors
 
 
@@ -775,33 +906,13 @@ for file in (get_files_in_folder(entropy_maps_path)):
 #     if gaussian_file != None:
 #         gaussian_maps.append(gaussian_file)
 
-# Build map sequence for testing
+# Build random map sequence each run (different order every execution)
 full_maps = torch.stack(entropy_maps)
-n_cycles = 4
-
-
-# ===========================================================================
-# Option A: every cycle uses a NEW map (no immediate repeats).
-# Uncomment this block to use all-new maps.
 perm = torch.randperm(full_maps.shape[0])
-maps = full_maps[perm[:n_cycles]]
-# ===========================================================================
-# Option B: current map may be SAME as previous map for some cycles.
-# Uncomment this block (and comment Option A) to inject repeats.
-# repeat_prob = 0.5  # probability to reuse previous map
-# perm = torch.randperm(full_maps.shape[0])
-# seed_pool = full_maps[perm[:n_cycles]]
-# maps_list = [seed_pool[0]]
-# for i in range(1, n_cycles):
-#     if random.random() < repeat_prob:
-#         maps_list.append(maps_list[-1].clone())
-#     else:
-#         maps_list.append(seed_pool[i])
-# maps = torch.stack(maps_list, dim=0)
-# ===========================================================================
+maps = full_maps[perm[:4]]
 
 # Sample grid of (0 to 1) to match the resolution
-N, H, W = maps.shape
+_, H, W = maps.shape
 xs = torch.linspace(0, 1, W)
 ys = torch.linspace(0, 1, H)
 X, Y = torch.meshgrid(xs, ys, indexing='xy')   
@@ -829,19 +940,19 @@ k_expanded = k.unsqueeze(0)
 # Calculate the values of the Fourier basis functions at the sample points, _s, for all Fourier modes, k_expanded
 fk_vals_all = torch.cos(_s[:, None, :] * k_expanded).prod(dim=-1)
 
-
-trajectory, full_trajectory, full_lambda, head_len_per_cycle, phik_list, time_list, replanning_diagnostics = replanning(maps, _s, k_expanded, lamk)
-
+trajectory, full_trajectory, full_lambda, head_len_per_cycle, phik_list, time_list, replanning_diagnostics = replanning(
+    maps, _s, k_expanded, lamk
+)
 
 print(f"Execution time: {time_list}")
-print("Cycle diagnostics (delta, tier, iters, fallback, dwell, transit, precision, recall, v_high, v_low):")
+print("Cycle diagnostics (delta, tier, iters, fallback, head_d1, cov_d, dwell, idle, f1, split):")
 for d in replanning_diagnostics:
     print(
         f"  cycle={d['cycle']}, delta={d['delta']:.6f}, tier={d['tier_used']}, "
         f"iters={d['iterations_used']}, fallback={d['fallback_to_full']}, "
-        f"dwell={d['high_info_dwell_ratio']:.3f}, transit={d['low_info_transit_efficiency']:.3f}, "
-        f"prec={d['sensor_precision']:.3f}, rec={d['sensor_recall']:.3f}, "
-        f"v_hi={d['avg_speed_high_info']:.3f}, v_lo={d['avg_speed_low_info']:.3f}"
+        f"head_d1={d['head_dist_h1_at_tau']:.3f}, cov_d={d['mean_hotspot_coverage_dist']:.3f}, "
+        f"dwell={d['high_info_dwell_ratio']:.3f}, idle={d['low_info_idle_rate']:.3f}, "
+        f"f1={d['sensor_f1_high_info']:.3f}, split={d['split_jump_metric']:.3f}"
     )
 
 num_cycles = len(trajectory)
