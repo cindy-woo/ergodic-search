@@ -157,12 +157,17 @@ def extract_hotspots(info_map_norm, max_hotspots=MAX_HOTSPOTS, hotspot_quantile=
     return torch.stack(hotspots, dim=0), torch.stack(scores, dim=0)
 
 
-def choose_ordered_goals(info_map, x0):
-    info_map_norm = normalize_info_map(info_map)
-    hotspots, scores = extract_hotspots(info_map_norm)
+def choose_ordered_goals_from_recon(phik_recon, x0):
+    # Ensure phik_recon is normalized to [0, 1] for the hotspot extractor
+    phik_recon_norm = normalize_info_map(phik_recon)
+    
+    # Use the existing extractor on the reconstructed map
+    hotspots, scores = extract_hotspots(phik_recon_norm)
+    
     start_xy = x0[:2].to(dtype=torch.float32, device=hotspots.device)
-
     d_start = torch.norm(hotspots - start_xy.unsqueeze(0), dim=1)
+    
+    # Weighting logic remains the same
     h1_score = scores - GOAL_DISTANCE_WEIGHT * d_start
     h1_idx = int(torch.argmax(h1_score).item())
 
@@ -182,9 +187,7 @@ def choose_ordered_goals(info_map, x0):
         prev = pick
 
     ordered_goals = hotspots[torch.tensor(ordered_ids[:3], dtype=torch.long, device=hotspots.device)]
-    sorted_ids = torch.argsort(scores, descending=True)
-    hotspot_pool = hotspots[sorted_ids]
-    return ordered_goals, hotspot_pool
+    return ordered_goals, hotspots
 
 
 def rollout_states(x0, u):
@@ -227,7 +230,7 @@ def evaluate_head_quality(active_plan_u, active_plan_cursor, x0, info_map, tau):
     u_window = build_warm_seed_from_remainder(active_plan_u, active_plan_cursor, T_HORIZON)
     states = rollout_states(x0, u_window)
     head_pts = states[1:tau + 1, :2]
-    ordered_goals, _ = choose_ordered_goals(info_map, x0)
+    ordered_goals, _ = choose_ordered_goals_from_recon(info_map, x0)
     d = torch.norm(head_pts - ordered_goals[0].unsqueeze(0), dim=1)
     return float(torch.min(d).item())
 
@@ -262,7 +265,6 @@ def seed_controls_from_goals(x0, ordered_goals, info_map, t_horizon, tau):
     lam_target = torch.sigmoid((rough_info - q_hi) / SENSOR_TEMP).clamp(1e-4, 1.0 - 1e-4)
     u[:, 2] = torch.log(lam_target / (1.0 - lam_target)) / 5.0
     return u
-
 
 def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, head_w=1.0, tail_w=TAIL_W_OPT, hotspots=None, ordered_goals=None):
     displacements = 0.07 * u[:, :2]
@@ -400,6 +402,7 @@ def optimize_trajectory(
     lamk,
     hk,
     info_map,
+    phik_recon,
     u_prev=None,
     t_horizon=T_HORIZON,
     tau=HEAD_STEPS,
@@ -408,7 +411,7 @@ def optimize_trajectory(
     lr=LR,
 ):
     tau = int(min(max(tau, 1), t_horizon))
-    ordered_goals, hotspots = choose_ordered_goals(info_map, x0)
+    ordered_goals, hotspots = choose_ordered_goals_from_recon(phik_recon, x0)
     ordered_goals = ordered_goals.to(device=x0.device, dtype=torch.float32)
     hotspots = hotspots.to(device=x0.device, dtype=torch.float32)
     head_goal = ordered_goals[0]
@@ -502,20 +505,13 @@ def optimize_trajectory(
 
 def replanning(maps, _s, k_expanded, lamk, hk, t_horizon=T_HORIZON, tau=HEAD_STEPS):
     x0 = torch.tensor([0.54, 0.30], dtype=torch.float32)
-    trajectories = []
-    full_trajectories = []
-    full_lambda_list = []
-    head_len_list = []
-    phik_list = []
-    cycle_maps = []
-    time_list = []
-    diagnostics = []
+    H, W = maps.shape[1], maps.shape[2] 
+    
+    trajectories, full_trajectories, full_lambda_list = [], [], []
+    head_len_list, phik_list, cycle_maps, time_list, diagnostics = [], [], [], [], []
 
-    last_map = None
-    active_phik = None
-    active_plan_u = None
-    active_plan_states = None
-    active_plan_cursor = 0
+    last_map, active_phik, active_plan_u = None, None, None
+    active_plan_states, active_plan_cursor = None, 0
     active_plan_mode = "forward"
 
     for i, info_map in enumerate(maps):
@@ -523,64 +519,56 @@ def replanning(maps, _s, k_expanded, lamk, hk, t_horizon=T_HORIZON, tau=HEAD_STE
         t0 = time.time()
         info_map = normalize_info_map(info_map)
 
+        # 1. Handle plan completion/reversal (Moved out of the main logic)
         if active_plan_u is not None and active_plan_cursor >= active_plan_u.shape[0]:
             active_plan_states = torch.flip(active_plan_states, dims=[0]).detach()
             active_plan_u = controls_from_states(active_plan_states).detach()
             active_plan_cursor = 0
             active_plan_mode = "reverse" if active_plan_mode == "forward" else "forward"
 
+        # 2. Map change detection (Must run every cycle)
         delta = float("inf") if last_map is None else mean_abs_map_delta(info_map, last_map)
-        if delta <= UNCHANGED_EPS:
-            tier = "unchanged"
-        elif delta <= SMALL_CHANGE_THR:
-            tier = "small"
-        elif delta < LARGE_CHANGE_THR:
-            tier = "medium"
-        else:
-            tier = "large"
+        if delta <= UNCHANGED_EPS: tier = "unchanged"
+        elif delta <= SMALL_CHANGE_THR: tier = "small"
+        elif delta < LARGE_CHANGE_THR: tier = "medium"
+        else: tier = "large"
 
-        if active_phik is None:
-            active_phik = phik_from_map(info_map.flatten(), _s, k_expanded)
-
-        need_replan = active_plan_u is None
-        reason = "bootstrap"
+        # 3. Determine replanning need
+        need_replan = (active_plan_u is None)
+        reason = "bootstrap" if need_replan else "none"
         u_prev_seed = None
-        max_iters = ITERS_FULL
-        min_iters = MIN_ITERS_FULL
+        max_iters, min_iters = ITERS_FULL, MIN_ITERS_FULL
         head_quality_dist = None
 
         if not need_replan:
             if tier == "unchanged":
-                print("Map unchanged:")
+                # Note: This function needs phik_recon now for consistency
+                # For now, we'll pass the info_map as a fallback or fix the function below
                 head_quality_dist = evaluate_head_quality(active_plan_u, active_plan_cursor, x0, info_map, tau)
                 if head_quality_dist > HEAD_QUALITY_DIST_THR:
-                    print("Execute next head with slight replanning.")
-                    need_replan = True
-                    reason = "unchanged_refine_head"
+                    need_replan, reason = True, "unchanged_refine_head"
                     u_prev_seed = build_warm_seed_from_remainder(active_plan_u, active_plan_cursor, t_horizon)
-                    max_iters = ITERS_REFINE
-                    min_iters = MIN_ITERS_WARM
-                else:
-                    print("Execute next head without replanning.")
-                    reason = "reuse_plan"
+                    max_iters, min_iters = ITERS_REFINE, MIN_ITERS_WARM
             else:
-                print("Running full replan from current robot state.")
-                need_replan = True
-                reason = "map_changed"
+                need_replan, reason = True, "map_changed"
                 u_prev_seed = build_warm_seed_from_remainder(active_plan_u, active_plan_cursor, t_horizon)
                 if tier == "small":
-                    max_iters = ITERS_WARM
-                    min_iters = MIN_ITERS_WARM
+                    max_iters, min_iters = ITERS_WARM, MIN_ITERS_WARM
                 else:
-                    u_prev_seed = None
-                    max_iters = ITERS_FULL
-                    min_iters = MIN_ITERS_FULL
+                    u_prev_seed = None 
 
         opt_diag = {"iters_used": 0, "init_loss": 0.0, "final_loss": 0.0, "opt_window": 0}
+        
+        # 4. Unified Optimization Block
         if need_replan:
             active_phik = phik_from_map(info_map.flatten(), _s, k_expanded)
+            
+            # Use global fk_vals_all to reconstruct the map
+            phik_recon_flat = torch.matmul(fk_vals_all, active_phik)
+            phik_recon = phik_recon_flat.reshape(H, W) 
+
             active_plan_u, opt_diag = optimize_trajectory(
-                x0, active_phik, k_expanded, lamk, hk, info_map,
+                x0, active_phik, k_expanded, lamk, hk, info_map, phik_recon,
                 u_prev=u_prev_seed, t_horizon=t_horizon, tau=tau,
                 max_iters=max_iters, min_iters=min_iters, lr=LR
             )
@@ -588,6 +576,7 @@ def replanning(maps, _s, k_expanded, lamk, hk, t_horizon=T_HORIZON, tau=HEAD_STE
             active_plan_cursor = 0
             active_plan_mode = "forward"
 
+        # 5. Execution and Logging (Safe to run because active_plan_u is now initialized)
         cycle_plan_u = build_warm_seed_from_remainder(active_plan_u, active_plan_cursor, t_horizon)
         cycle_plan_states = rollout_states(x0, cycle_plan_u).detach()
 
@@ -611,22 +600,14 @@ def replanning(maps, _s, k_expanded, lamk, hk, t_horizon=T_HORIZON, tau=HEAD_STE
         cycle_time = float(time.time() - t0)
         time_list.append(cycle_time)
         diagnostics.append({
-            "cycle": int(i),
-            "delta": float(delta),
-            "tier": tier,
-            "replanned": bool(need_replan),
-            "reason": reason,
-            "iters_used": int(opt_diag["iters_used"]),
-            "cycle_time_sec": cycle_time,
+            "cycle": int(i), "delta": float(delta), "tier": tier, "replanned": bool(need_replan),
+            "reason": reason, "iters_used": int(opt_diag["iters_used"]), "cycle_time_sec": cycle_time,
             "head_quality_dist": float(head_quality_dist) if head_quality_dist is not None else -1.0,
-            "sensor_on_ratio_head": sensor_on_ratio,
-            "control_energy_head": control_energy,
-            "plan_mode": active_plan_mode,
+            "sensor_on_ratio_head": sensor_on_ratio, "control_energy_head": control_energy, "plan_mode": active_plan_mode,
         })
         last_map = info_map.clone()
 
     return trajectories, full_trajectories, full_lambda_list, head_len_list, phik_list, cycle_maps, time_list, diagnostics
-
 
 def get_files_in_folder(path):
     files = []
@@ -686,7 +667,7 @@ ys = torch.linspace(0, 1, H)
 X, Y = torch.meshgrid(xs, ys, indexing="xy")
 _s = torch.stack([X.reshape(-1), Y.reshape(-1)], dim=1)
 
-k1, k2 = np.meshgrid(np.arange(0, 20), np.arange(0, 20))
+k1, k2 = np.meshgrid(np.arange(0, 35), np.arange(0, 35))
 k = torch.tensor(np.stack([k1.ravel(), k2.ravel()], axis=-1), dtype=torch.float32)
 lamk = torch.exp(-0.8 * torch.norm(k, dim=1))
 hk = torch.clamp(torch.tensor([get_hk(ki) for ki in k.numpy()]), min=1e-6)
@@ -837,7 +818,7 @@ for i in range(num_cycles):
         hotspot_quantile=HOTSPOT_QUANTILE,
         min_sep=HOTSPOT_MIN_SEP,
     )
-    ordered_goals_i, _ = choose_ordered_goals(map_i_t, x0_i)
+    ordered_goals_i, _ = choose_ordered_goals_from_recon(map_i_t, x0_i)
     hotspots_np = hotspots_i.cpu().numpy()
     scores_np = scores_i.cpu().numpy()
     ordered_np = ordered_goals_i.cpu().numpy()
