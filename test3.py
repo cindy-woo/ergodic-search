@@ -17,44 +17,45 @@ from matplotlib.lines import Line2D
 # -------------------------
 T_HORIZON = 100
 HEAD_STEPS = 20
-BRIDGE_LEN = 12
+BRIDGE_LEN = 6
 
-SENSOR_ON_THRESHOLD = 0.60
-HIGH_INFO_QUANTILE = 0.70
-HOTSPOT_QUANTILE = 0.84
-MAX_HOTSPOTS = 6
+SENSOR_ON_THRESHOLD = 0.70
+HIGH_INFO_QUANTILE = 0.85
+HOTSPOT_QUANTILE = 0.90
+MAX_HOTSPOTS = 3
 HOTSPOT_MIN_SEP = 0.12
 
-GOAL_DISTANCE_WEIGHT = 0.20
+GOAL_DISTANCE_WEIGHT = 1.10
 H2H3_DISTANCE_WEIGHT = 0.60
-HEAD_GOAL_W = 12.0
-TERM_GOAL_W = 2.5
+HEAD_GOAL_W = 30.0
+TERM_GOAL_W = 1.2
 
-PATH_INFO_W = 1.10
-COVERAGE_W = 0.90
-ORDER_WEIGHTS = (2.4, 1.6, 1.1)
+PATH_INFO_W = 0.95
+COVERAGE_W = 0.18
+ORDER_WEIGHTS = (3.8, 1.0, 0.4)
+HEAD_DIRECT_W = 12.0
 
-SPEED_W = 0.38
-LOW_INFO_FAST_W = 0.35
+SPEED_W = 0.55
+LOW_INFO_FAST_W = 1.10
 V_HIGH = 0.010
 V_LOW = 0.060
 
-SENSOR_BCE_W = 1.80
-SENSOR_OFF_W = 2.10
+SENSOR_BCE_W = 2.40
+SENSOR_OFF_W = 4.00
 SENSOR_BIN_W = 0.02
 SENSOR_SMOOTH_W = 0.02
-SENSOR_TEMP = 0.05
+SENSOR_TEMP = 0.025
 
-CONTROL_W = 0.001
+CONTROL_W = 0.002
 SMOOTH_W = 0.001
-CURV_W = 0.006
+CURV_W = 0.004
 BARRIER_W = 10.0
 
-TAIL_W_OPT = 0.90
-DISCOUNT_RATE = 0.30
-SEAM_VEL_W = 8.0
-SEAM_ACC_W = 3.0
-SEAM_LAM_W = 1.0
+TAIL_W_OPT = 0.35
+DISCOUNT_RATE = 1.30
+SEAM_VEL_W = 10.0
+SEAM_ACC_W = 4.0
+SEAM_LAM_W = 1.5
 
 UNCHANGED_EPS = 1e-6
 SMALL_CHANGE_THR = 0.03
@@ -62,11 +63,11 @@ LARGE_CHANGE_THR = 0.10
 HEAD_QUALITY_DIST_THR = 0.13
 
 LR = 1e-3
-ITERS_FULL = 800
-ITERS_WARM = 260
-ITERS_REFINE = 140
-MIN_ITERS_FULL = 120
-MIN_ITERS_WARM = 60
+ITERS_FULL = 1500
+ITERS_WARM = 600
+ITERS_REFINE = 300
+MIN_ITERS_FULL = 800
+MIN_ITERS_WARM = 100
 PATIENCE = 25
 REL_IMPROVE_TOL = 1e-4
 
@@ -74,7 +75,7 @@ REL_IMPROVE_TOL = 1e-4
 # -------------------------
 # Map sequence options
 # -------------------------
-N_CYCLES = 4
+N_CYCLES = 5
 USE_REPEAT_MODE = True
 REPEAT_PROB = 0.50
 RUN_SEED = None  # set int for reproducibility; None => different each run
@@ -161,7 +162,7 @@ def choose_ordered_goals(info_map, x0):
     start_xy = x0[:2].to(dtype=torch.float32, device=hotspots.device)
 
     d_start = torch.norm(hotspots - start_xy.unsqueeze(0), dim=1)
-    h1_score = 2.0 * scores - GOAL_DISTANCE_WEIGHT * d_start
+    h1_score = scores - GOAL_DISTANCE_WEIGHT * d_start
     h1_idx = int(torch.argmax(h1_score).item())
 
     ordered_ids = [h1_idx]
@@ -173,7 +174,7 @@ def choose_ordered_goals(info_map, x0):
             continue
         rem = torch.tensor(remaining, dtype=torch.long, device=hotspots.device)
         d_prev = torch.norm(hotspots[rem] - hotspots[prev].unsqueeze(0), dim=1)
-        score_next = 1.4 * scores[rem] - H2H3_DISTANCE_WEIGHT * d_prev
+        score_next = scores[rem] - H2H3_DISTANCE_WEIGHT * d_prev
         pick = int(rem[torch.argmax(score_next)].item())
         ordered_ids.append(pick)
         remaining.remove(pick)
@@ -318,6 +319,15 @@ def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, 
             seg_w = torch.tensor(ORDER_WEIGHTS[:len(seg_terms)], dtype=torch.float32, device=u.device)
             ordered_term = torch.sum(seg_w * torch.stack(seg_terms))
 
+    # Keep the head direct toward first goal to suppress detours.
+    head_direct_term = 0.0
+    if ordered_goals is not None and tau is not None and t_steps > 0:
+        tau_i = int(min(max(tau, 2), t_steps))
+        head_seg = tr[:tau_i, :2]
+        alpha = torch.linspace(1.0 / tau_i, 1.0, tau_i, device=u.device).unsqueeze(1)
+        line_seg = x0.unsqueeze(0) + alpha * (ordered_goals[0] - x0).unsqueeze(0)
+        head_direct_term = HEAD_DIRECT_W * torch.mean(torch.sum((head_seg - line_seg) ** 2, dim=1))
+
     q_hi = torch.quantile(info_map_norm.flatten(), HIGH_INFO_QUANTILE)
     target_lam = torch.sigmoid((info_values - q_hi) / SENSOR_TEMP)
     eps = 1e-6
@@ -349,6 +359,7 @@ def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, 
         + low_fast_term
         + coverage_term
         + ordered_term
+        + head_direct_term
         + sensor_bce_term
         + sensor_off_term
         + sensor_bin_term
@@ -466,7 +477,11 @@ def optimize_trajectory(
         last_loss = curr_loss
         iters_used = i + 1
         if iters_used >= min_iters and plateau >= PATIENCE:
+            print(f"Early stop at iter {iters_used}: relative improvement plateau.")
             break
+
+        if (i+1) % 20 == 0:
+            print(f"Iteration {i+1}, Loss: {loss.item()}")
 
     u_out = build_u(head, tail).detach()
     if u_out.shape[0] < t_horizon:
@@ -503,6 +518,7 @@ def replanning(maps, _s, k_expanded, lamk, hk, t_horizon=T_HORIZON, tau=HEAD_STE
     active_plan_mode = "forward"
 
     for i, info_map in enumerate(maps):
+        print(f"\n=== cycle {i} ===")
         t0 = time.time()
         info_map = normalize_info_map(info_map)
 
@@ -534,20 +550,24 @@ def replanning(maps, _s, k_expanded, lamk, hk, t_horizon=T_HORIZON, tau=HEAD_STE
 
         if not need_replan:
             if tier == "unchanged":
+                print("Map unchanged:")
                 head_quality_dist = evaluate_head_quality(active_plan_u, active_plan_cursor, x0, info_map, tau)
                 if head_quality_dist > HEAD_QUALITY_DIST_THR:
+                    print("Execute next head with slight replanning.")
                     need_replan = True
                     reason = "unchanged_refine_head"
                     u_prev_seed = build_warm_seed_from_remainder(active_plan_u, active_plan_cursor, t_horizon)
                     max_iters = ITERS_REFINE
                     min_iters = MIN_ITERS_WARM
                 else:
+                    print("Execute next head without replanning.")
                     reason = "reuse_plan"
             else:
+                print("Running full replan from current robot state.")
                 need_replan = True
                 reason = "map_changed"
                 u_prev_seed = build_warm_seed_from_remainder(active_plan_u, active_plan_cursor, t_horizon)
-                if tier in ("small", "medium"):
+                if tier == "small":
                     max_iters = ITERS_WARM
                     min_iters = MIN_ITERS_WARM
                 else:
