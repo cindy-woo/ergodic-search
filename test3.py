@@ -4,6 +4,7 @@
 import os
 import random
 import time
+from tkinter import FALSE
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -76,7 +77,7 @@ REL_IMPROVE_TOL = 1e-4
 # Map sequence options
 # -------------------------
 N_CYCLES = 5
-USE_REPEAT_MODE = True
+USE_REPEAT_MODE = False
 REPEAT_PROB = 0.50
 RUN_SEED = None  # set int for reproducibility; None => different each run
 
@@ -821,4 +822,60 @@ def plot_trajectory_figure(background_mode="map"):
 
 plot_trajectory_figure(background_mode="map")
 plot_trajectory_figure(background_mode="phik")
+
+num_cycles = len(trajectory)
+# Extra figure: visualize extract_hotspots(...) output on each cycle map.
+fig_hot, axes_hot = plt.subplots(1, num_cycles, figsize=(4 * num_cycles, 4), squeeze=False)
+for i in range(num_cycles):
+    ax = axes_hot[0, i]
+    map_i_t = cycle_maps[i]
+    map_i = map_i_t.cpu().numpy()
+    x0_i = torch.tensor(full_trajectory[i][0, :2], dtype=torch.float32, device=map_i_t.device)
+    hotspots_i, scores_i = extract_hotspots(
+        normalize_info_map(map_i_t),
+        max_hotspots=MAX_HOTSPOTS,
+        hotspot_quantile=HOTSPOT_QUANTILE,
+        min_sep=HOTSPOT_MIN_SEP,
+    )
+    ordered_goals_i, _ = choose_ordered_goals(map_i_t, x0_i)
+    hotspots_np = hotspots_i.cpu().numpy()
+    scores_np = scores_i.cpu().numpy()
+    ordered_np = ordered_goals_i.cpu().numpy()
+
+    ax.imshow(map_i, extent=[0, 1, 0, 1], origin="lower", cmap="viridis")
+    ax.contourf(X.numpy(), Y.numpy(), map_i, cmap="viridis")
+    ax.scatter(hotspots_np[:, 0], hotspots_np[:, 1], c="white", s=80, marker="X", edgecolors="black", linewidths=0.8)
+    ax.scatter(ordered_np[:, 0], ordered_np[:, 1], c="gold", s=95, marker="o", edgecolors="black", linewidths=0.9)
+    if ordered_np.shape[0] >= 2:
+        ax.plot(ordered_np[:, 0], ordered_np[:, 1], color="gold", linewidth=1.2, alpha=0.9)
+    for j in range(hotspots_np.shape[0]):
+        ax.text(
+            hotspots_np[j, 0] + 0.01,
+            hotspots_np[j, 1] + 0.01,
+            f"{j + 1}:{scores_np[j]:.2f}",
+            color="white",
+            fontsize=8,
+            weight="bold",
+        )
+    for j in range(ordered_np.shape[0]):
+        ax.text(
+            ordered_np[j, 0] + 0.012,
+            ordered_np[j, 1] - 0.02,
+            f"h{j + 1}",
+            color="gold",
+            fontsize=8,
+            weight="bold",
+        )
+    ax.set_title(f"Map {i + 1}: Extracted Hotspots")
+    ax.set_aspect("equal")
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    if i == 0:
+        handles = [
+            Line2D([0], [0], marker="X", linestyle="None", markersize=8, markerfacecolor="white", markeredgecolor="black", label="Hotspot"),
+            Line2D([0], [0], marker="o", linestyle="None", markersize=8, markerfacecolor="gold", markeredgecolor="black", label="choose_ordered_goals (h1-h3)"),
+        ]
+        ax.legend(handles=handles, loc="lower left", fontsize=8, framealpha=0.85)
+
+fig_hot.tight_layout()
 plt.show()
