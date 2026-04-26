@@ -9,30 +9,31 @@ from matplotlib.lines import Line2D
 from matplotlib.colors import LinearSegmentedColormap
 import time
 
-SENSOR_ON_THRESHOLD = 0.60
+SENSOR_ON_THRESHOLD = 0.75
 HIGH_INFO_QUANTILE = 0.70
 LOW_SPEED_THRESHOLD = 0.015
 HOTSPOT_QUANTILE = 0.86
 MAX_HOTSPOTS = 5
 
 # Core planner weights (kept intentionally small in count).
-TEMPORAL_DISCOUNT = 0.35
+TEMPORAL_DISCOUNT = 0.45
 ORDER_WEIGHTS = (3.0, 2.0, 1.2)
-HEAD_GOAL_W = 12.0
+HEAD_GOAL_W = 26.0
 TERMINAL_GOAL_W = 1.0
-COVERAGE_W = 0.35
+COVERAGE_W = 0.10
 INFO_CLUSTER_W = 0.70
-SPEED_W = 0.60
-DIRECTNESS_W = 0.35
-TURN_W = 0.06
+SPEED_W = 1.20
+DIRECTNESS_W = 1.20
+TURN_W = 0.08
 SENSOR_BCE_W = 1.50
-SENSOR_OFF_W = 0.40
-SENSOR_SMOOTH_W = 0.06
+SENSOR_OFF_W = 1.30
+SENSOR_OFF_HARD_W = 1.10
+SENSOR_SMOOTH_W = 0.03
 V_HIGH = 0.008
-V_LOW = 0.060
-SPLIT_VEL_W = 3.0
-SPLIT_ACC_W = 1.2
-SPLIT_LAM_W = 1.0
+V_LOW = 0.090
+SPLIT_VEL_W = 6.0
+SPLIT_ACC_W = 6.0
+SPLIT_LAM_W = 3.0
 
 # # Dynamics and target distribution
 # # The dynamics are defined as the constrained continuous time dynamical system
@@ -79,7 +80,7 @@ def get_ck_weighted(tr, k_expanded, weights, hk):
     return (fk.T @ weights) / (Z * hk)
 
 def compute_sensor_lambda(u):
-    return torch.clamp(torch.sigmoid(5.0 * u[:, 2]), 0.0, 1.0)
+    return torch.clamp(torch.sigmoid(7.0 * u[:, 2]), 0.0, 1.0)
 
 def sample_info_values(points, info_map):
     H, W = info_map.shape
@@ -335,7 +336,8 @@ def fourier_ergodic_loss(
     info_cluster_term = -INFO_CLUSTER_W * torch.mean(info_norm.pow(2))
     v_target = V_HIGH + (1.0 - info_norm) * (V_LOW - V_HIGH)
     speed_term = SPEED_W * torch.mean((speed - v_target).pow(2))
-    directness_term = DIRECTNESS_W * torch.mean(speed * (1.0 - info_norm).pow(2))
+    low_info_fast_gap = torch.relu(0.85 * V_LOW - speed)
+    directness_term = DIRECTNESS_W * torch.mean((1.0 - info_norm).pow(2) * low_info_fast_gap.pow(2))
 
     if displacements.shape[0] > 1:
         turn_term = TURN_W * torch.mean(torch.sum((displacements[1:] - displacements[:-1]).pow(2), dim=1))
@@ -343,15 +345,16 @@ def fourier_ergodic_loss(
         turn_term = 0.0
 
     # Sensor policy: ON in high info, OFF in low info.
-    q70 = torch.quantile(info_map_norm.flatten(), HIGH_INFO_QUANTILE)
-    target_lam = torch.sigmoid((info_norm - q70) / 0.05)
+    q_hi = torch.quantile(info_map_norm.flatten(), 0.80)
+    target_lam = torch.sigmoid((info_norm - q_hi) / 0.015)
     eps = 1e-6
     sensor_bce = -(
-        2.5 * target_lam * torch.log(lam + eps)
+        3.0 * target_lam * torch.log(lam + eps)
         + (1.0 - target_lam) * torch.log(1.0 - lam + eps)
     )
     sensor_bce_term = SENSOR_BCE_W * torch.mean(sensor_bce)
     sensor_off_term = SENSOR_OFF_W * torch.mean(lam * (1.0 - target_lam))
+    sensor_off_hard_term = SENSOR_OFF_HARD_W * torch.mean(lam * (info_norm < q_hi).float())
     if lam.shape[0] > 1:
         sensor_smooth_term = SENSOR_SMOOTH_W * torch.mean((lam[1:] - lam[:-1]).pow(2))
     else:
@@ -367,7 +370,7 @@ def fourier_ergodic_loss(
             (t1, t2, ordered_goals[1]),
             (t2, T, ordered_goals[2]),
         )
-        beta = 25.0
+        beta = 18.0
         for j, (s0, s1, goal) in enumerate(segments):
             if s1 <= s0:
                 continue
@@ -378,13 +381,28 @@ def fourier_ergodic_loss(
             d2 = d.pow(2)
             soft_min = -torch.logsumexp(-beta * d2, dim=0) / beta
             progress_penalty = torch.relu(d[1:] - d[:-1]).mean() if d.shape[0] > 1 else 0.0
+
+            # Stay close to the straight line between segment anchors (anti-detour).
+            if j == 0:
+                a, b = x0[:2], ordered_goals[0]
+            elif j == 1:
+                a, b = ordered_goals[0], ordered_goals[1]
+            else:
+                a, b = ordered_goals[1], ordered_goals[2]
+            ab = b - a
+            ab2 = torch.sum(ab * ab) + 1e-8
+            tproj = torch.sum((seg - a.unsqueeze(0)) * ab.unsqueeze(0), dim=1) / ab2
+            tproj = torch.clamp(tproj, 0.0, 1.0)
+            proj = a.unsqueeze(0) + tproj.unsqueeze(1) * ab.unsqueeze(0)
+            line_dev = torch.mean(torch.sum((seg - proj).pow(2), dim=1))
+
             seg_w = ORDER_WEIGHTS[min(j, len(ORDER_WEIGHTS) - 1)]
-            ordered_term = ordered_term + seg_w * (soft_min + 0.6 * progress_penalty)
+            ordered_term = ordered_term + seg_w * (soft_min + 1.10 * progress_penalty + 0.90 * line_dev)
 
     coverage_term = 0.0
     if hotspots is not None and hotspots.numel() > 0:
         dist2 = torch.sum((tr[:, None, :2] - hotspots[None, :, :])**2, dim=2)
-        smooth_min = -torch.logsumexp(-20.0 * dist2, dim=0) / 20.0
+        smooth_min = -torch.logsumexp(-12.0 * dist2, dim=0) / 12.0
         coverage_term = COVERAGE_W * torch.mean(smooth_min)
 
     # Head/tail split smoothness penalties.
@@ -393,10 +411,17 @@ def fourier_ergodic_loss(
     split_lam_term = 0.0
     if tau is not None and T >= 2:
         tau_i = int(min(max(tau, 1), T - 1))
-        split_vel_term = split_vel_w * torch.sum((u[tau_i - 1, :2] - u[tau_i, :2])**2)
-        split_lam_term = split_lam_w * (lam[tau_i - 1] - lam[tau_i]).pow(2)
-        if tau_i + 1 < T:
-            split_acc_term = split_acc_w * torch.sum((u[tau_i + 1, :2] - 2.0 * u[tau_i, :2] + u[tau_i - 1, :2])**2)
+        left = max(tau_i - 2, 1)
+        right = min(tau_i + 2, T - 1)
+
+        vel_diffs = u[left:right + 1, :2] - u[left - 1:right, :2]
+        lam_diffs = lam[left:right + 1] - lam[left - 1:right]
+        split_vel_term = split_vel_w * torch.mean(torch.sum(vel_diffs.pow(2), dim=1))
+        split_lam_term = split_lam_w * torch.mean(lam_diffs.pow(2))
+
+        if right + 1 < T:
+            acc_seq = u[left + 1:right + 2, :2] - 2.0 * u[left:right + 1, :2] + u[left - 1:right, :2]
+            split_acc_term = split_acc_w * torch.mean(torch.sum(acc_seq.pow(2), dim=1))
 
     loss = ergodic_term \
             + 0.0005 * torch.mean(u[:, :2].pow(2)) \
@@ -407,6 +432,7 @@ def fourier_ergodic_loss(
             + turn_term \
             + sensor_bce_term \
             + sensor_off_term \
+            + sensor_off_hard_term \
             + sensor_smooth_term \
             + ordered_term \
             + coverage_term \
@@ -479,9 +505,9 @@ def optimize_trajectory(
         rough_tr = rough_tr.clamp(0.0, 1.0)
         info_map_norm = normalize_info_map(info_map)
         rough_info, _, _ = sample_info_values(rough_tr, info_map_norm)
-        q_hi = torch.quantile(info_map_norm.flatten(), HIGH_INFO_QUANTILE)
-        lam_target = torch.sigmoid((rough_info - q_hi) / 0.055).clamp(1e-4, 1.0 - 1e-4)
-        head[:, 2] = torch.log(lam_target / (1.0 - lam_target)) / 5.0
+        q_hi = torch.quantile(info_map_norm.flatten(), 0.80)
+        lam_target = torch.sigmoid((rough_info - q_hi) / 0.015).clamp(1e-4, 1.0 - 1e-4)
+        head[:, 2] = torch.log(lam_target / (1.0 - lam_target)) / 7.0
         tail = None
         loss_tau = tau
     else:
@@ -496,7 +522,7 @@ def optimize_trajectory(
         head = u_seed[:opt_window].clone()
         if xy_noise_std > 0:
             warm_len = min(tau, head.shape[0])
-            head[:warm_len, :2] += xy_noise_std * torch.randn_like(head[:warm_len, :2])
+            head[:warm_len, :2] += (0.75 * xy_noise_std) * torch.randn_like(head[:warm_len, :2])
         tail = u_seed[opt_window:].clone().detach()
         loss_tau = tau
     head = torch.nn.Parameter(head)
