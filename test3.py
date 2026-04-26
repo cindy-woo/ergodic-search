@@ -10,26 +10,7 @@ from matplotlib.colors import LinearSegmentedColormap
 import random
 import time
 
-SENSOR_ON_THRESHOLD = 0.80
-HIGH_INFO_QUANTILE = 0.90
-GOAL_HOTSPOT_QUANTILE = 0.70
-GOAL_DISTANCE_WEIGHT = 0.55
-GOAL_W = 3.00
-HEAD_GOAL_W = 4.00
-
-PATH_INFO_W = 0.65
-COVERAGE_W = 0.60
-SPEED_W = 0.55
-LOW_INFO_FAST_W = 0.80
-SENSOR_BCE_W = 1.40
-SENSOR_OFF_W = 1.00
-SENSOR_SMOOTH_W = 0.03
-V_HIGH = 0.012
-V_LOW = 0.060
-TAIL_W_OPT = 0.75
-DISCOUNT_RATE = 0.60
-SEAM_VEL_W = 2.0
-SEAM_ACC_W = 0.8
+SENSOR_ON_THRESHOLD = 0.70
 
 # # Dynamics and target distribution
 # # The dynamics are defined as the constrained continuous time dynamical system
@@ -78,273 +59,118 @@ def get_ck_weighted(tr, k_expanded, weights, hk):
 def compute_sensor_lambda(u):
     return torch.clamp(torch.sigmoid(5.0 * u[:, 2]), 0.0, 1.0)
 
-def normalize_info_map(info_map):
-    map_min = torch.min(info_map)
-    map_max = torch.max(info_map)
-    return (info_map - map_min) / (map_max - map_min + 1e-8)
-
-def sample_info_values(points, info_map):
-    H, W = info_map.shape
-    ix = (points[:, 0] * (W - 1)).long().clamp(0, W - 1)
-    iy = (points[:, 1] * (H - 1)).long().clamp(0, H - 1)
-    return info_map[iy, ix], ix, iy
-
-def extract_hotspots(info_map_norm, max_hotspots=5, hotspot_quantile=0.80, min_sep=0.10):
-    H, W = info_map_norm.shape
-    flat = info_map_norm.flatten()
-    threshold = torch.quantile(flat, hotspot_quantile)
-    candidate_ids = torch.nonzero(flat >= threshold, as_tuple=False).flatten()
-    if candidate_ids.numel() == 0:
-        candidate_ids = torch.topk(flat, k=min(max_hotspots, flat.numel())).indices
-
-    candidate_scores = flat[candidate_ids]
-    sorted_ids = candidate_ids[torch.argsort(candidate_scores, descending=True)]
-    denom_x = float(max(W - 1, 1))
-    denom_y = float(max(H - 1, 1))
-    hotspots = []
-    scores = []
-
-    for idx in sorted_ids:
-        idx_i = int(idx.item())
-        y = idx_i // W
-        x = idx_i % W
-        point = torch.tensor([x / denom_x, y / denom_y], dtype=torch.float32, device=info_map_norm.device)
-        if hotspots:
-            min_dist = torch.stack([torch.norm(point - p) for p in hotspots]).min()
-            if float(min_dist.item()) < min_sep:
-                continue
-        hotspots.append(point)
-        scores.append(flat[idx_i])
-        if len(hotspots) >= max_hotspots:
-            break
-
-    if not hotspots:
-        idx_i = int(torch.argmax(flat).item())
-        y = idx_i // W
-        x = idx_i % W
-        hotspots = [torch.tensor([x / denom_x, y / denom_y], dtype=torch.float32, device=info_map_norm.device)]
-        scores = [flat[idx_i]]
-
-    return torch.stack(hotspots, dim=0), torch.stack(scores, dim=0)
-
-def choose_priority_goal(info_map, x0, hotspot_quantile=GOAL_HOTSPOT_QUANTILE, max_hotspots=4):
-    info_map_norm = normalize_info_map(info_map)
-    hotspots, scores = extract_hotspots(
-        info_map_norm,
-        max_hotspots=max_hotspots,
-        hotspot_quantile=hotspot_quantile,
-        min_sep=0.10,
-    )
-    start_xy = x0[:2].to(device=hotspots.device, dtype=torch.float32)
-    dists = torch.norm(hotspots - start_xy.unsqueeze(0), dim=1)
-    rank_score = scores - GOAL_DISTANCE_WEIGHT * dists
-    head_goal = hotspots[int(torch.argmax(rank_score).item())]
-    terminal_goal = hotspots[int(torch.argmax(scores).item())]
-    return head_goal, terminal_goal, hotspots
-
 # ergodic metric + other costs----
 # Primary loss function for trajectory optimization
 # ergodic metric (how well the trajcetory matches the information distribution) + regularization + penalty
 # Overall, the tells how well the path explores the interesting areas in ergodic metric,
 # how much energy the robot used, how msoothly the robot moved, if the robot stayed within the map,
 # how much the robot activated its sensors, and ow much valuable information the robot gathered
-def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, head_w=1.0, tail_w=0.25, hotspots=None):
+def fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, head_w=1.0, tail_w=0.25):
     displacements = 0.07 * u[:, :2]
     tr = torch.cumsum(displacements, dim=0) + x0
     tr = tr.clamp(0.0, 1.0)
 
     T = u.shape[0]
-    lam = compute_sensor_lambda(u)
+    
+    # Continuous relaxation of the sensor variable to [0, 1]
+    lam = torch.sigmoid(u[:, 2])
 
+    # Exponential discount: Heavily weights the immediate "head" of the trajectory
+    # so the optimizer prioritizes the accuracy of the next executed steps.
+    disc = torch.exp(-3.0 * torch.arange(T, device=u.device, dtype=torch.float32) / T)
+    
     w = torch.ones(T, device=u.device)
     if tau is not None:
         w[:tau] = head_w
         w[tau:] = tail_w
-
-    disc = torch.exp(-DISCOUNT_RATE * torch.arange(T, device=u.device, dtype=torch.float32) / T)
     w = w * disc
 
-    # Keep path optimization independent from sensor randomness.
-    ck = get_ck_weighted(tr[:, :2], k_expanded, w, hk)
+    # Sample information values along the current trajectory
+    H, W = info_map.shape
+    ix = (tr[:, 0] * (W - 1)).long().clamp(0, W - 1)
+    iy = (tr[:, 1] * (H - 1)).long().clamp(0, H - 1)
+    info_values = info_map[iy, ix]
 
+    # Calculate Ergodic Metric matching
+    ck = get_ck_weighted(tr[:, :2], k_expanded, lam * w, hk)
     phik_normed = (phik - phik.mean()) / (phik.std() + 1e-6)
     ck_normed   = (ck   - ck.mean())   / (ck.std()   + 1e-6)
     ergodic_term = torch.sum(lamk * (phik_normed - ck_normed)**2)
 
-    info_map_norm = normalize_info_map(info_map)
-    info_values, _, _ = sample_info_values(tr[:, :2], info_map_norm)
+    # 1. SPARSE SENSING PENALTY: L1 norm on lambda, penalized heavily in LOW info regions
+    sparsity_cost = 0.5 * torch.sum(lam * (1.0 - info_values) * w)
 
-    # Cover high-info regions and reduce detours through low-info regions.
-    path_info_term = -PATH_INFO_W * torch.mean(info_values.pow(2))
-    speed = torch.norm(displacements, dim=1)
-    v_target = V_HIGH + (1.0 - info_values) * (V_LOW - V_HIGH)
-    speed_term = SPEED_W * torch.mean((speed - v_target).pow(2))
-    low_fast_gap = torch.relu(0.80 * V_LOW - speed)
-    low_fast_term = LOW_INFO_FAST_W * torch.mean((1.0 - info_values).pow(2) * low_fast_gap.pow(2))
+    # 2. INFORMATION REWARD: Explicit reward for having the sensor ON in HIGH info regions
+    reward_term = -1.5 * torch.sum(lam * (info_values**3) * w)
 
-    coverage_term = 0.0
-    if hotspots is not None and hotspots.numel() > 0:
-        dist2 = torch.sum((tr[:, None, :2] - hotspots[None, :, :])**2, dim=2)
-        smooth_min = -torch.logsumexp(-18.0 * dist2, dim=0) / 18.0
-        coverage_term = COVERAGE_W * torch.mean(smooth_min)
+    # Kinematic costs and map boundaries
+    control_cost = 0.005 * torch.mean(u[:, :2]**2)
+    smoothness_cost = 0.001 * torch.sum((u[1:, :2] - u[:-1, :2])**2)
+    barrier_cost = 10 * torch.sum(torch.clamp_min(tr - 1, 0)**2 + torch.clamp_min(-tr, 0)**2)
 
-    # Sensor should be ON only in high-information regions.
-    q_hi = torch.quantile(info_map_norm.flatten(), HIGH_INFO_QUANTILE)
-    target_lam = torch.sigmoid((info_values - q_hi) / 0.03)
-    eps = 1e-6
-    sensor_bce = -(
-        2.8 * target_lam * torch.log(lam + eps)
-        + (1.0 - target_lam) * torch.log(1.0 - lam + eps)
-    )
-    sensor_bce_term = SENSOR_BCE_W * torch.mean(sensor_bce)
-    sensor_off_term = SENSOR_OFF_W * torch.mean(lam * (info_values < q_hi).float())
-    if lam.shape[0] > 1:
-        sensor_smooth_term = SENSOR_SMOOTH_W * torch.mean((lam[1:] - lam[:-1]).pow(2))
-    else:
-        sensor_smooth_term = 0.0
-
-    loss = ergodic_term \
-            + 0.001 * torch.mean(u[:, :2]**2) \
-            + 0.001 * torch.sum((u[1:, :2] - u[:-1, :2])**2) \
-            + 0.002 * torch.sum((u[2:, :2] - 2.0 * u[1:-1, :2] + u[:-2, :2])**2) \
-            + 10 * torch.sum(torch.clamp_min(tr - 1, 0)**2 + torch.clamp_min(-tr, 0)**2) \
-            + path_info_term \
-            + speed_term \
-            + low_fast_term \
-            + coverage_term \
-            + sensor_bce_term \
-            + sensor_off_term \
-            + sensor_smooth_term
-
-    if tau is not None and T >= 3:
-        tau_i = int(min(max(tau, 1), T - 2))
-        seam_vel = SEAM_VEL_W * torch.sum((u[tau_i, :2] - u[tau_i - 1, :2])**2)
-        seam_acc = SEAM_ACC_W * torch.sum((u[tau_i + 1, :2] - 2.0 * u[tau_i, :2] + u[tau_i - 1, :2])**2)
-        loss = loss + seam_vel + seam_acc
+    loss = ergodic_term + sparsity_cost + reward_term + control_cost + smoothness_cost + barrier_cost
     return loss
 
 
-def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T=100, tau=20, num_iters=1500, lr=1e-3):
-    # u = torch.empty((T, 3), dtype=torch.float32)
-    # u[:, :2].normal_(mean=0.0, std=0.01)
-    # u[:, 2].uniform_(-0.5, 0.5)
-    # u.requires_grad_()
-
-    # If u_prev exists, warm-start from that. If not, random-init. Normally, only the inital trajectory will be None
-    # if u_prev is None:
-    #     u = torch.empty((T, 3), dtype=torch.float32)
-    #     u[:, :2].normal_(mean=0.0, std=0.01)
-    #     u[:, 2].uniform_(-0.5, 0.5)
-    #     u.requires_grad_()
-    #     print("u for None", u.shape)
-    # else:
-    #     # u_prev is u from the previous trajectory, starting from the defined time step
-    #     tau = 9
-    #     u_add = torch.empty((tau, 3), dtype=torch.float32)
-    #     u_add[:, :2].normal_(mean=0.0, std=0.01)
-    #     u_add[:, 2].uniform_(-0.5, 0.5)
-    #     u = torch.cat([u_prev, u_add], dim = 0)
-    #     u = u.clone().detach().requires_grad_()
-    #     print("u for else", u.shape)
-    
+def optimize_trajectory(x0, phik, k_expanded, lamk, hk, info_map, u_prev=None, T=100, tau=20, num_iters=1500, lr=1e-2):
     tau = int(min(max(tau, 1), T))
-    head_goal, terminal_goal, hotspots = choose_priority_goal(info_map, x0)
-    head_goal = head_goal.to(device=x0.device, dtype=torch.float32)
-    terminal_goal = terminal_goal.to(device=x0.device, dtype=torch.float32)
-    hotspots = hotspots.to(device=x0.device, dtype=torch.float32)
+    H_map, W_map = info_map.shape
+    
+    # Calculate global goal to gently pull the trajectory tail
+    max_val = torch.max(info_map)
+    jy, ix = torch.where(info_map == max_val)
+    gx = ix.float().mean() / max(W_map - 1, 1)
+    gy = jy.float().mean() / max(H_map - 1, 1)
+    goal = torch.tensor([gx, gy], dtype=torch.float32, device=x0.device)
 
-    # Initial call (no previous trajectory): optimize the full horizon.
     if u_prev is None:
-        head = torch.empty((T, 3), device=x0.device, dtype=torch.float32)
-        head[:, :2].normal_(mean=0.0, std=0.01)
-        head[:, 2].uniform_(-0.5, 0.5)
-        warm_len = min(tau, T)
-        if warm_len > 0:
-            ctrl = ((head_goal - x0) / (0.07 * warm_len)).clamp(min=-1.0, max=1.0)
-            head[:warm_len, :2] = ctrl + 0.01 * torch.randn_like(head[:warm_len, :2])
-        if warm_len < T:
-            rem_len = max(T - warm_len, 1)
-            ctrl2 = ((terminal_goal - head_goal) / (0.07 * rem_len)).clamp(min=-1.0, max=1.0)
-            head[warm_len:, :2] = ctrl2 + 0.01 * torch.randn_like(head[warm_len:, :2])
-        tail = None
-        loss_tau = tau
+        # First Cycle: Cold Start
+        # Full 100-timestep optimization requires full iterations
+        u_init = torch.empty((T, 3), device=x0.device, dtype=torch.float32)
+        u_init[:, :2].normal_(mean=0.0, std=0.01)
+        u_init[:, 2].uniform_(-0.5, 0.5)
+        iters = num_iters
     else:
-        # Warm start from previous controls; optimize only the head segment.
+        # Subsequent Cycles: Warm Start (Receding Horizon)
+        # Shift the previous trajectory left by tau, dropping the executed head
         u_seed = u_prev.detach().to(device=x0.device, dtype=torch.float32)
-        if u_seed.shape[0] >= T:
-            u_seed = u_seed[:T]
-        else:
-            pad = u_seed[-1:, :].repeat(T - u_seed.shape[0], 1)
-            u_seed = torch.cat([u_seed, pad], dim=0)
-
-        head = u_seed[:tau].clone()
-        head[:, :2] += 0.005 * torch.randn_like(head[:, :2])
-        tail = u_seed[tau:].clone().detach()
-        loss_tau = tau
-    head = torch.nn.Parameter(head)
-
-    # LBFGS optimizer
-    # optimizer = torch.optim.LBFGS([head], lr=lr, max_iter=20, history_size=10)
-    optimizer = torch.optim.Adam([head], lr=lr)
-    def u_builder(head, tail):
-        if tail is None:
-            return head
-        else:
-            return torch.cat([head, tail], dim = 0)
-
-    for i in range(num_iters):
-        # def closure():
-        #     optimizer.zero_grad()
-        #     u = u_builder(head, tail)
-        #     max_val = torch.max(info_map)
-        #     jy, ix = torch.where(info_map == max_val)
-        #     gx = ix.float().mean() / max(W - 1, 1) 
-        #     gy = jy.float().mean() / max(H - 1, 1)
-        #     goal = torch.tensor([gx, gy], dtype=torch.float32, device=u.device)
-        #     loss = loss_with_goal(u, x0, phik, k_expanded, lamk, hk, info_map, tau=tau, head_w=1.0, tail_w=0.10, goal = goal, goal_w = 2.5)
-        #     loss.backward()
-        #     assert head.grad is not None and head.grad.abs().mean().item() > 0, "Head not receiving gradients."
-        #     assert not (tail is not None and tail.requires_grad), "Tail should be frozen."
-        #     torch.nn.utils.clip_grad_norm_([head], max_norm=0.1)
-        #     return loss
+        shifted_head = u_seed[tau:] 
         
-        # if (i+1) % 100 == 0:
-        #     if not torch.isfinite(loss).all().item():
-        #         print("Warning: non-finite loss encountered.")
-        # loss = optimizer.step(closure)
+        # Generate a fresh tail of length tau to cap the 100-step horizon
+        new_tail = torch.empty((tau, 3), device=x0.device, dtype=torch.float32)
+        new_tail[:, :2].normal_(mean=0.0, std=0.01)
+        new_tail[:, 2].uniform_(-0.5, 0.5)
+        
+        u_init = torch.cat([shifted_head, new_tail], dim=0)
+        
+        # Massive efficiency gain: 80% of the path is already optimized. 
+        # We only need a fraction of the iterations to refine the head and settle the tail.
+        iters = 75 
+
+    u = torch.nn.Parameter(u_init)
+    optimizer = torch.optim.Adam([u], lr=lr)
+
+    for i in range(iters):
         optimizer.zero_grad()
-        u = u_builder(head, tail)
         loss = loss_with_goal(
             u, x0, phik, k_expanded, lamk, hk, info_map,
-            tau=loss_tau, head_w=1.0, tail_w=TAIL_W_OPT,
-            goal=terminal_goal, goal_w=GOAL_W,
-            head_goal=head_goal, head_goal_w=HEAD_GOAL_W,
-            hotspots=hotspots
+            tau=tau, head_w=1.0, tail_w=0.10, goal=goal, goal_w=2.5
         )
         loss.backward()
         optimizer.step()
+        
         with torch.no_grad():
-                head[:, :2].clamp_(min = -1.0, max = 1.0)
-                head[:, 2].clamp_(min = -1.0, max = 1.0)
-        if (i+1) % 20 == 0:
-            print(f"Iteration {i+1}, Loss: {loss.item()}")
-            # xf = x0.clone()
-            # tr = [xf]
-            # for step in u.detach():
-            #     xf, _ = f(xf, step)
-            #     tr.append(xf)
-            # tr = torch.stack(tr).numpy()
-            # plt.scatter(tr[:-1, 0], tr[:-1, 1], c=u.detach()[:, 2].numpy(), cmap='plasma')
-            # plt.show()
-    u = u_builder(head, tail).detach()
-    if u.shape[0] != T:
-        if u.shape[0] > T:
-            u = u[:T]
-        else:
-            padding = torch.zeros((T - u.shape[0], 3), device=u.device, dtype=torch.float32)
-            padding[:, :] = u[-1, :].detach()
-            u = torch.cat([u, padding], dim=0)
-    return u
+            # Clamp kinematics. Dimension 2 (lambda) relies on sigmoid, no hard clamp needed here.
+            u[:, :2].clamp_(min=-1.0, max=1.0)
+            
+    # Pad to T just in case of dimension mismatch
+    u_out = u.detach()
+    if u_out.shape[0] < T:
+        padding = torch.zeros((T - u_out.shape[0], 3), device=u.device, dtype=torch.float32)
+        padding[:, :] = u_out[-1, :]
+        u_out = torch.cat([u_out, padding], dim=0)
+        
+    return u_out[:T]
 
 def check_itomp_consistency(u_prev, u_opt, T = 100, tau = 9):
     target_len = max(0, T - tau)
@@ -364,36 +190,15 @@ def phik_from_map(map_flattened, sample, k_expanded):
     return (fk_vals * map_flattened[:, None]).sum(dim=0) / (map_flattened.sum() + 1e-8)
 
 # combines ergodic loss over phik with a terminal goal penalty
-def loss_with_goal(
-    u, x0, phik, k_expanded, lamk, hk, info_map,
-    tau=None, head_w=1.0, tail_w=0.25,
-    goal=None, goal_w=0.0,
-    head_goal=None, head_goal_w=0.0,
-    hotspots=None
-):
-    lambda_erg = fourier_ergodic_loss(
-        u, x0, phik, k_expanded, lamk, hk, info_map,
-        tau=tau, head_w=head_w, tail_w=tail_w, hotspots=hotspots
-    )
+def loss_with_goal(u, x0, phik, k_expanded, lamk, hk, info_map, tau=None, head_w=1.0, tail_w=0.25, goal=None, goal_w=0.0):
+    lambda_erg = fourier_ergodic_loss(u, x0, phik, k_expanded, lamk, hk, info_map, tau=tau, head_w=head_w, tail_w=tail_w)
     # rollout trajectory to get final state x_T
     x = x0.clone()
-    x_head = None
-    head_idx = None
-    if tau is not None:
-        head_idx = min(max(int(tau), 1), u.shape[0])
     for step in u:
         x, _ = f(x, step[:2])
-        if head_idx is not None:
-            head_idx -= 1
-            if head_idx == 0 and x_head is None:
-                x_head = x
     term = 0.0
     if goal is not None and goal_w > 0:
         term = goal_w * (x - goal).pow(2).sum()
-    if head_goal is not None and head_goal_w > 0:
-        if x_head is None:
-            x_head = x
-        term = term + head_goal_w * (x_head - head_goal).pow(2).sum()
     return lambda_erg + term
 
 def rollout_states(x0, u):
@@ -435,11 +240,10 @@ def replanning(maps, _s, k_expanded, lamk, num_iters=1500, T=100, tau=20):
     def build_cycle_window_u(plan_u, cursor, horizon):
         rem = plan_u[cursor:].detach()
         if rem.shape[0] == 0:
-            rem = torch.zeros((1, 3), device=plan_u.device, dtype=plan_u.dtype)
+            rem = plan_u[-1:, :].detach()
         if rem.shape[0] >= horizon:
             return rem[:horizon].clone().detach()
-        # Hold position when we run out of planned controls instead of pushing to the edge.
-        pad = torch.zeros((horizon - rem.shape[0], 3), device=plan_u.device, dtype=plan_u.dtype)
+        pad = rem[-1:, :].repeat(horizon - rem.shape[0], 1)
         return torch.cat([rem, pad], dim=0).clone().detach()
 
     # Each new plan with the tail of the previous u
@@ -626,9 +430,9 @@ for i in range(num_cycles):
     ax_ht.imshow(phik_recon, extent=[0, 1, 0, 1], origin='lower', cmap='viridis')
     ax_ht.contourf(X.numpy(), Y.numpy(), phik_recon, cmap='viridis')
     if tail_pts.shape[0] > 0:
-        ax_ht.scatter(tail_pts[:, 0], tail_pts[:, 1], s=20, c='white', alpha=0.40)
+        ax_ht.scatter(tail_pts[:, 0], tail_pts[:, 1], s=16, c='white', alpha=0.40)
     if head_pts.shape[0] > 0:
-        ax_ht.scatter(head_pts[:, 0], head_pts[:, 1], s=20, c='red', edgecolors='black', linewidths=0.5)
+        ax_ht.scatter(head_pts[:, 0], head_pts[:, 1], s=34, c='red', edgecolors='black', linewidths=0.5)
     ax_ht.scatter(full_tr[0, 0], full_tr[0, 1], c='w', s=50, marker='X')
     ax_ht.scatter(tr[-1, 0], tr[-1, 1], c='yellow', s=35)
     ax_ht.set_title(f"Map {i + 1}: Head/Tail")
@@ -637,10 +441,10 @@ for i in range(num_cycles):
     ax_ht.set_ylim(0, 1)
     if i == 0:
         legend_handles_ht = [
-            Line2D([0], [0], marker='o', linestyle='None', markersize=5, markerfacecolor='white', markeredgecolor='none', alpha=0.40, label='Tail'),
-            Line2D([0], [0], marker='o', linestyle='None', markersize=5, markerfacecolor='red', markeredgecolor='black', label='Head'),
-            Line2D([0], [0], marker='X', linestyle='None', markersize=5, markerfacecolor='white', markeredgecolor='white', label='Plan start'),
-            Line2D([0], [0], marker='o', linestyle='None', markersize=5, markerfacecolor='yellow', markeredgecolor='none', label='Executed head end'),
+            Line2D([0], [0], marker='o', linestyle='None', markersize=6, markerfacecolor='white', markeredgecolor='none', alpha=0.40, label='Tail'),
+            Line2D([0], [0], marker='o', linestyle='None', markersize=7, markerfacecolor='red', markeredgecolor='black', label='Head'),
+            Line2D([0], [0], marker='X', linestyle='None', markersize=7, markerfacecolor='white', markeredgecolor='white', label='Plan start'),
+            Line2D([0], [0], marker='o', linestyle='None', markersize=6, markerfacecolor='yellow', markeredgecolor='none', label='Executed head end'),
         ]
         ax_ht.legend(handles=legend_handles_ht, loc='lower left', fontsize=7, framealpha=0.85)
 
@@ -668,8 +472,8 @@ for i in range(num_cycles):
             edgecolors='cyan',
             linewidths=1.5,
         )
-    ax_sa.scatter(full_tr[0, 0], full_tr[0, 1], c='w', s=20, marker='X')
-    ax_sa.scatter(tr[-1, 0], tr[-1, 1], c='yellow', s=20)
+    ax_sa.scatter(full_tr[0, 0], full_tr[0, 1], c='w', s=50, marker='X')
+    ax_sa.scatter(tr[-1, 0], tr[-1, 1], c='yellow', s=35)
     ax_sa.set_title(f"Map {i + 1}: Sensor Lambda (100 Steps)")
     ax_sa.set_aspect('equal')
     ax_sa.set_xlim(0, 1)
@@ -677,10 +481,10 @@ for i in range(num_cycles):
     if i == 0:
         legend_handles_sa = [
             Line2D([0], [0], marker='o', linestyle='None', markersize=5, markerfacecolor='red', markeredgecolor='none', alpha=0.55, label='Tail (lambda color)'),
-            Line2D([0], [0], marker='o', linestyle='None', markersize=5, markerfacecolor='red', markeredgecolor='black', label='Head (lambda color)'),
-            Line2D([0], [0], marker='o', linestyle='None', markersize=5, markerfacecolor='none', markeredgecolor='cyan', label=f"Sensor ON (lambda >= {SENSOR_ON_THRESHOLD:.1f})"),
-            Line2D([0], [0], marker='X', linestyle='None', markersize=5, markerfacecolor='white', markeredgecolor='white', label='Plan start'),
-            Line2D([0], [0], marker='o', linestyle='None', markersize=5, markerfacecolor='yellow', markeredgecolor='none', label='Executed head end'),
+            Line2D([0], [0], marker='o', linestyle='None', markersize=7, markerfacecolor='red', markeredgecolor='black', label='Head (lambda color)'),
+            Line2D([0], [0], marker='o', linestyle='None', markersize=8, markerfacecolor='none', markeredgecolor='cyan', label=f"Sensor ON (lambda >= {SENSOR_ON_THRESHOLD:.1f})"),
+            Line2D([0], [0], marker='X', linestyle='None', markersize=7, markerfacecolor='white', markeredgecolor='white', label='Plan start'),
+            Line2D([0], [0], marker='o', linestyle='None', markersize=6, markerfacecolor='yellow', markeredgecolor='none', label='Executed head end'),
         ]
         ax_sa.legend(handles=legend_handles_sa, loc='lower left', fontsize=7, framealpha=0.8)
 
