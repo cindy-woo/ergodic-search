@@ -18,7 +18,7 @@ from matplotlib.lines import Line2D
 # -------------------------
 T_HORIZON = 100
 HEAD_STEPS = 20
-BRIDGE_LEN = 6
+BRIDGE_LEN = 5
 
 SENSOR_ON_THRESHOLD = 0.70
 HIGH_INFO_QUANTILE = 0.85
@@ -26,14 +26,14 @@ HOTSPOT_QUANTILE = 0.90
 MAX_HOTSPOTS = 3
 HOTSPOT_MIN_SEP = 0.12
 
-GOAL_DISTANCE_WEIGHT = 1.10
+GOAL_DISTANCE_WEIGHT = 0.70
 H2H3_DISTANCE_WEIGHT = 0.60
 HEAD_GOAL_W = 30.0
 TERM_GOAL_W = 1.2
 
 PATH_INFO_W = 0.95
 COVERAGE_W = 0.18
-ORDER_WEIGHTS = (3.8, 1.0, 0.4)
+ORDER_WEIGHTS = (2.0, 2.0, 2.0)
 HEAD_DIRECT_W = 12.0
 
 SPEED_W = 0.55
@@ -226,11 +226,11 @@ def build_warm_seed_from_remainder(active_plan_u, active_plan_cursor, horizon):
     return torch.cat([remainder, pad], dim=0).clone().detach()
 
 
-def evaluate_head_quality(active_plan_u, active_plan_cursor, x0, info_map, tau):
+def evaluate_head_quality(active_plan_u, active_plan_cursor, x0, phik_recon, tau):
     u_window = build_warm_seed_from_remainder(active_plan_u, active_plan_cursor, T_HORIZON)
     states = rollout_states(x0, u_window)
     head_pts = states[1:tau + 1, :2]
-    ordered_goals, _ = choose_ordered_goals_from_recon(info_map, x0)
+    ordered_goals, _ = choose_ordered_goals_from_recon(phik_recon, x0)
     d = torch.norm(head_pts - ordered_goals[0].unsqueeze(0), dim=1)
     return float(torch.min(d).item())
 
@@ -518,6 +518,9 @@ def replanning(maps, _s, k_expanded, lamk, hk, t_horizon=T_HORIZON, tau=HEAD_STE
         print(f"\n=== cycle {i} ===")
         t0 = time.time()
         info_map = normalize_info_map(info_map)
+        active_phik = phik_from_map(info_map.flatten(), _s, k_expanded)
+        phik_recon_flat = torch.matmul(fk_vals_all, active_phik)
+        phik_recon = phik_recon_flat.reshape(H, W) 
 
         # 1. Handle plan completion/reversal (Moved out of the main logic)
         if active_plan_u is not None and active_plan_cursor >= active_plan_u.shape[0]:
@@ -542,9 +545,7 @@ def replanning(maps, _s, k_expanded, lamk, hk, t_horizon=T_HORIZON, tau=HEAD_STE
 
         if not need_replan:
             if tier == "unchanged":
-                # Note: This function needs phik_recon now for consistency
-                # For now, we'll pass the info_map as a fallback or fix the function below
-                head_quality_dist = evaluate_head_quality(active_plan_u, active_plan_cursor, x0, info_map, tau)
+                head_quality_dist = evaluate_head_quality(active_plan_u, active_plan_cursor, x0, phik_recon, tau)
                 if head_quality_dist > HEAD_QUALITY_DIST_THR:
                     need_replan, reason = True, "unchanged_refine_head"
                     u_prev_seed = build_warm_seed_from_remainder(active_plan_u, active_plan_cursor, t_horizon)
@@ -561,12 +562,6 @@ def replanning(maps, _s, k_expanded, lamk, hk, t_horizon=T_HORIZON, tau=HEAD_STE
         
         # 4. Unified Optimization Block
         if need_replan:
-            active_phik = phik_from_map(info_map.flatten(), _s, k_expanded)
-            
-            # Use global fk_vals_all to reconstruct the map
-            phik_recon_flat = torch.matmul(fk_vals_all, active_phik)
-            phik_recon = phik_recon_flat.reshape(H, W) 
-
             active_plan_u, opt_diag = optimize_trajectory(
                 x0, active_phik, k_expanded, lamk, hk, info_map, phik_recon,
                 u_prev=u_prev_seed, t_horizon=t_horizon, tau=tau,
@@ -667,7 +662,7 @@ ys = torch.linspace(0, 1, H)
 X, Y = torch.meshgrid(xs, ys, indexing="xy")
 _s = torch.stack([X.reshape(-1), Y.reshape(-1)], dim=1)
 
-k1, k2 = np.meshgrid(np.arange(0, 35), np.arange(0, 35))
+k1, k2 = np.meshgrid(np.arange(0, 30), np.arange(0, 30))
 k = torch.tensor(np.stack([k1.ravel(), k2.ravel()], axis=-1), dtype=torch.float32)
 lamk = torch.exp(-0.8 * torch.norm(k, dim=1))
 hk = torch.clamp(torch.tensor([get_hk(ki) for ki in k.numpy()]), min=1e-6)
@@ -792,11 +787,11 @@ def plot_trajectory_figure(background_mode="map"):
     else:
         fig.tight_layout()
 
-    if sc_last is not None:
-        # Put colorbar in its own axis so bottom-row plots don't get resized.
-        cax = fig.add_axes([0.92, 0.15, 0.012, 0.70])
-        cbar = fig.colorbar(sc_last, cax=cax)
-        cbar.set_label("Sensor activation lambda (white=OFF, red=ON)")
+    # if sc_last is not None:
+    #     # Put colorbar in its own axis so bottom-row plots don't get resized.
+    #     cax = fig.add_axes([0.92, 0.15, 0.012, 0.70])
+    #     cbar = fig.colorbar(sc_last, cax=cax)
+    #     cbar.set_label("Sensor activation lambda (white=OFF, red=ON)")
 
     return fig
 
@@ -809,22 +804,25 @@ num_cycles = len(trajectory)
 fig_hot, axes_hot = plt.subplots(1, num_cycles, figsize=(4 * num_cycles, 4), squeeze=False)
 for i in range(num_cycles):
     ax = axes_hot[0, i]
-    map_i_t = cycle_maps[i]
-    map_i = map_i_t.cpu().numpy()
-    x0_i = torch.tensor(full_trajectory[i][0, :2], dtype=torch.float32, device=map_i_t.device)
+    phik_i = phik_list[i]
+    phik_recon_flat = torch.matmul(fk_vals_all, phik_i)
+    phik_recon_i = phik_recon_flat.reshape(H, W)
+
+    x0_i = torch.tensor(full_trajectory[i][0, :2], dtype=torch.float32, device=phik_recon_i.device)
     hotspots_i, scores_i = extract_hotspots(
-        normalize_info_map(map_i_t),
+        normalize_info_map(phik_recon_i),
         max_hotspots=MAX_HOTSPOTS,
         hotspot_quantile=HOTSPOT_QUANTILE,
         min_sep=HOTSPOT_MIN_SEP,
     )
-    ordered_goals_i, _ = choose_ordered_goals_from_recon(map_i_t, x0_i)
+    ordered_goals_i, _ = choose_ordered_goals_from_recon(phik_recon_i, x0_i)
     hotspots_np = hotspots_i.cpu().numpy()
     scores_np = scores_i.cpu().numpy()
     ordered_np = ordered_goals_i.cpu().numpy()
 
-    ax.imshow(map_i, extent=[0, 1, 0, 1], origin="lower", cmap="viridis")
-    ax.contourf(X.numpy(), Y.numpy(), map_i, cmap="viridis")
+    phik_recon_i = phik_recon_flat.reshape(H, W).cpu().numpy()
+    ax.imshow(phik_recon_i, extent=[0, 1, 0, 1], origin="lower", cmap="viridis")
+    ax.contourf(X.numpy(), Y.numpy(), phik_recon_i, cmap="viridis")
     ax.scatter(hotspots_np[:, 0], hotspots_np[:, 1], c="white", s=80, marker="X", edgecolors="black", linewidths=0.8)
     ax.scatter(ordered_np[:, 0], ordered_np[:, 1], c="gold", s=95, marker="o", edgecolors="black", linewidths=0.9)
     if ordered_np.shape[0] >= 2:
