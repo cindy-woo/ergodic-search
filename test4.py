@@ -79,8 +79,8 @@ REL_IMPROVE_TOL = 1e-4
 # -------------------------
 # Map sequence options
 # -------------------------
-N_CYCLES = 5
-USE_REPEAT_MODE = False
+N_CYCLES = 10
+USE_REPEAT_MODE = True
 REPEAT_PROB = 0.50
 RUN_SEED = None  # set int for reproducibility; None => different each run
 
@@ -667,7 +667,7 @@ if RUN_SEED is not None:
     np.random.seed(RUN_SEED)
     random.seed(RUN_SEED)
 
-entropy_maps_path = "/Users/cindy/Desktop/ergodic-search/entropy_maps"
+entropy_maps_path = "/home/younkyuw/Documents/ergodic-search/entropy_maps"
 entropy_maps = []
 for file in get_files_in_folder(entropy_maps_path):
     entropy_file = load_files(file)

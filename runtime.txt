@@ -1,0 +1,37 @@
+Execution time per cycle (sec): [16.352699995040894, 21.29059910774231, 17.500147104263306, 6.983463764190674, 3.592590808868408, 13.652508735656738, 12.159860134124756, 17.202025413513184, 17.566017389297485, 18.19817090034485]
+Cycle diagnostics:
+  cycle=0, tier=large, replanned=True (bootstrap), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.200, control_energy_head=0.188, cycle_time=16.353s
+  cycle=1, tier=large, replanned=True (map_changed), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.200, control_energy_head=0.170, cycle_time=21.291s
+  cycle=2, tier=large, replanned=True (map_changed), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.000, control_energy_head=0.049, cycle_time=17.500s
+  cycle=3, tier=small, replanned=True (map_changed), iters=600, head_quality_dist=-1.000, sensor_on_ratio_head=0.200, control_energy_head=0.201, cycle_time=6.983s
+  cycle=4, tier=unchanged, replanned=True (unchanged_refine_head), iters=300, head_quality_dist=0.328, sensor_on_ratio_head=0.400, control_energy_head=0.144, cycle_time=3.593s
+  cycle=5, tier=large, replanned=True (map_changed), iters=1203, head_quality_dist=-1.000, sensor_on_ratio_head=0.150, control_energy_head=0.178, cycle_time=13.653s
+  cycle=6, tier=large, replanned=True (map_changed), iters=1053, head_quality_dist=-1.000, sensor_on_ratio_head=0.000, control_energy_head=0.215, cycle_time=12.160s
+  cycle=7, tier=large, replanned=True (map_changed), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.050, control_energy_head=0.178, cycle_time=17.202s
+  cycle=8, tier=large, replanned=True (map_changed), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.100, control_energy_head=0.250, cycle_time=17.566s
+  cycle=9, tier=medium, replanned=True (map_changed), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.150, control_energy_head=0.381, cycle_time=18.198s
+
+Total optimizer iterations used: 12156
+Static baseline iterations (full replan each cycle): 15000
+Iteration saving vs static baseline: 19.0%
+
+
+------------------------------------------------
+
+
+Execution time per cycle (sec): [16.185527801513672, 14.816000938415527, 15.12847113609314, 14.999276876449585, 3.125375509262085, 0.17389440536499023, 0.17467308044433594, 3.132324457168579, 15.458639144897461, 0.19357728958129883]
+Cycle diagnostics:
+  cycle=0, tier=large, replanned=True (bootstrap), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.100, control_energy_head=0.184, cycle_time=16.186s
+  cycle=1, tier=medium, replanned=True (map_changed), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.050, control_energy_head=0.254, cycle_time=14.816s
+  cycle=2, tier=large, replanned=True (map_changed), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.150, control_energy_head=0.323, cycle_time=15.128s
+  cycle=3, tier=medium, replanned=True (map_changed), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.050, control_energy_head=0.207, cycle_time=14.999s
+  cycle=4, tier=unchanged, replanned=True (unchanged_refine_head), iters=300, head_quality_dist=0.210, sensor_on_ratio_head=0.000, control_energy_head=0.098, cycle_time=3.125s
+  cycle=5, tier=unchanged, replanned=False (none), iters=0, head_quality_dist=0.030, sensor_on_ratio_head=0.000, control_energy_head=0.068, cycle_time=0.174s
+  cycle=6, tier=unchanged, replanned=False (none), iters=0, head_quality_dist=0.087, sensor_on_ratio_head=0.150, control_energy_head=0.519, cycle_time=0.175s
+  cycle=7, tier=unchanged, replanned=True (unchanged_refine_head), iters=300, head_quality_dist=0.250, sensor_on_ratio_head=0.500, control_energy_head=0.216, cycle_time=3.132s
+  cycle=8, tier=large, replanned=True (map_changed), iters=1500, head_quality_dist=-1.000, sensor_on_ratio_head=0.100, control_energy_head=0.258, cycle_time=15.459s
+  cycle=9, tier=unchanged, replanned=False (none), iters=0, head_quality_dist=0.027, sensor_on_ratio_head=0.250, control_energy_head=0.057, cycle_time=0.194s
+
+Total optimizer iterations used: 8100
+Static baseline iterations (full replan each cycle): 15000
+Iteration saving vs static baseline: 46.0%
