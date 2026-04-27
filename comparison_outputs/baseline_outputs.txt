@@ -1,0 +1,39 @@
+Frontier-based (frontier)
+  mean_coverage_high_info=0.000000
+  mean_coverage_weighted=0.507537
+  mean_coverage_global=0.002750
+  global_high_info_coverage_ratio=0.000000
+  mean_plan_time_sec=0.013630
+  total_plan_time_sec=0.136298
+  mean_ergodicity=55.060196
+  final_ergodicity=57.981041
+  red_k_mean=1.563682
+  white_k_mean=1.563112
+  k_change_red_minus_white=0.000570
+
+Probabilistic heuristic (probabilistic)
+  mean_coverage_high_info=0.000514
+  mean_coverage_weighted=0.474033
+  mean_coverage_global=0.012750
+  global_high_info_coverage_ratio=0.125000
+  mean_plan_time_sec=0.010291
+  total_plan_time_sec=0.102911
+  mean_ergodicity=58.315966
+  final_ergodicity=62.183369
+  red_k_mean=1.623817
+  white_k_mean=1.624327
+  k_change_red_minus_white=-0.000510
+
+Greedy info-max (greedy_info)
+  mean_coverage_high_info=0.000006
+  mean_coverage_weighted=0.677662
+  mean_coverage_global=0.002500
+  global_high_info_coverage_ratio=0.000000
+  mean_plan_time_sec=0.016391
+  total_plan_time_sec=0.163914
+  mean_ergodicity=57.168557
+  final_ergodicity=61.675365
+  red_k_mean=1.622368
+  white_k_mean=1.650792
+  k_change_red_minus_white=-0.028424
+
