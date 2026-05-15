@@ -79,7 +79,7 @@ REL_IMPROVE_TOL = 1e-4
 # -------------------------
 # Map sequence options
 # -------------------------
-N_CYCLES = 3
+N_CYCLES = 1
 USE_REPEAT_MODE = True
 REPEAT_PROB = 0.50
 RUN_SEED = None  # set int for reproducibility; None => different each run
@@ -715,7 +715,7 @@ print(f"Iteration saving vs static baseline: {100.0 * iter_saving:.1f}%")
 
 def plot_trajectory_figure(background_mode="map"):
     num_cycles = len(trajectory)
-    fig, axes = plt.subplots(2, num_cycles, figsize=(4 * num_cycles, 8), squeeze=False)
+    fig = plt.plot(num_cycles)
     sensor_cmap = LinearSegmentedColormap.from_list("sensor_white_red", ["#ffffff", "#ff0000"])
     sc_last = None
 
@@ -736,77 +736,78 @@ def plot_trajectory_figure(background_mode="map"):
         else:
             bg = cycle_maps[i].cpu().numpy()
 
-        ax_ht = axes[0, i]
-        ax_sa = axes[1, i]
+        # ax_ht = axes[0, i]
+        # ax_sa = axes[1, i]
 
         # Top row: Head / Tail
-        ax_ht.imshow(bg, extent=[0, 1, 0, 1], origin="lower", cmap="viridis")
-        ax_ht.contourf(X.numpy(), Y.numpy(), bg, cmap="viridis")
-        if tail_pts.shape[0] > 0:
-            ax_ht.scatter(tail_pts[:, 0], tail_pts[:, 1], s=16, c="white", alpha=0.40)
-        if head_pts.shape[0] > 0:
-            ax_ht.scatter(head_pts[:, 0], head_pts[:, 1], s=34, c="red", edgecolors="black", linewidths=0.5)
-        ax_ht.scatter(full_tr[0, 0], full_tr[0, 1], c="w", s=50, marker="X")
-        ax_ht.scatter(tr[-1, 0], tr[-1, 1], c="yellow", s=35)
-        ax_ht.set_title("Map: Head/Tail")
-        ax_ht.set_aspect("equal")
-        ax_ht.set_xlim(0, 1)
-        ax_ht.set_ylim(0, 1)
-        if i == 0:
-            legend_handles_ht = [
-                Line2D([0], [0], marker="o", linestyle="None", markersize=6, markerfacecolor="white", markeredgecolor="none", alpha=0.40, label="Tail"),
-                Line2D([0], [0], marker="o", linestyle="None", markersize=7, markerfacecolor="red", markeredgecolor="black", label="Head"),
-                Line2D([0], [0], marker="X", linestyle="None", markersize=7, markerfacecolor="white", markeredgecolor="white", label="Plan start"),
-                Line2D([0], [0], marker="o", linestyle="None", markersize=6, markerfacecolor="yellow", markeredgecolor="none", label="Executed head end"),
-            ]
-            ax_ht.legend(handles=legend_handles_ht, loc="lower left", fontsize=7, framealpha=0.85)
+        plt.imshow(bg, extent=[0, 1, 0, 1], origin="lower", cmap="viridis")
+        plt.contourf(X.numpy(), Y.numpy(), bg, cmap="viridis")
+        # if tail_pts.shape[0] > 0:
+        #     ax_ht.scatter(tail_pts[:, 0], tail_pts[:, 1], s=16, c="white", alpha=0.40)
+        # if head_pts.shape[0] > 0:
+        #     ax_ht.scatter(head_pts[:, 0], head_pts[:, 1], s=34, c="red", edgecolors="black", linewidths=0.5)
+        # ax_ht.scatter(full_tr[0, 0], full_tr[0, 1], c="w", s=50, marker="X")
+        # ax_ht.scatter(tr[-1, 0], tr[-1, 1], c="yellow", s=35)
+        # ax_ht.set_title("Map: Head/Tail")
+        # plt.set_aspect("equal")
+        plt.xlim(0, 1)
+        plt.ylim(0, 1)
+        # if i == 0:
+        #     legend_handles_ht = [
+        #         Line2D([0], [0], marker="o", linestyle="None", markersize=6, markerfacecolor="white", markeredgecolor="none", alpha=0.40, label="Tail"),
+        #         Line2D([0], [0], marker="o", linestyle="None", markersize=7, markerfacecolor="red", markeredgecolor="black", label="Head"),
+        #         Line2D([0], [0], marker="X", linestyle="None", markersize=7, markerfacecolor="white", markeredgecolor="white", label="Plan start"),
+        #         Line2D([0], [0], marker="o", linestyle="None", markersize=6, markerfacecolor="yellow", markeredgecolor="none", label="Executed head end"),
+        #     ]
+        #     ax_ht.legend(handles=legend_handles_ht, loc="lower left", fontsize=7, framealpha=0.85)
 
         # Bottom row: Sensor Lambda (100 steps)
-        ax_sa.imshow(bg, extent=[0, 1, 0, 1], origin="lower", cmap="viridis")
-        ax_sa.contourf(X.numpy(), Y.numpy(), bg, cmap="viridis")
-        if tail_pts.shape[0] > 0:
-            sc_last = ax_sa.scatter(
-                tail_pts[:, 0], tail_pts[:, 1],
-                s=14, c=lam_tail, cmap=sensor_cmap, vmin=0.0, vmax=1.0, alpha=0.55
-            )
-        if head_pts.shape[0] > 0:
-            sc_last = ax_sa.scatter(
-                head_pts[:, 0], head_pts[:, 1],
-                s=34, c=lam_head, cmap=sensor_cmap, vmin=0.0, vmax=1.0,
-                edgecolors="black", linewidths=0.5, alpha=0.95
-            )
+        # ax_sa.imshow(bg, extent=[0, 1, 0, 1], origin="lower", cmap="viridis")
+        # ax_sa.contourf(X.numpy(), Y.numpy(), bg, cmap="viridis")
+        # if tail_pts.shape[0] > 0:
+        #     sc_last = ax_sa.scatter(
+        #         tail_pts[:, 0], tail_pts[:, 1],
+        #         s=14, c=lam_tail, cmap=sensor_cmap, vmin=0.0, vmax=1.0, alpha=0.55
+        #     )
+        # if head_pts.shape[0] > 0:
+        #     sc_last = ax_sa.scatter(
+        #         head_pts[:, 0], head_pts[:, 1],
+        #         s=34, c=lam_head, cmap=sensor_cmap, vmin=0.0, vmax=1.0,
+        #         edgecolors="black", linewidths=0.5, alpha=0.95
+        #     )
 
-        sensor_on = lam_i >= SENSOR_ON_THRESHOLD
-        if np.any(sensor_on):
-            ax_sa.scatter(
-                full_pts[sensor_on, 0],
-                full_pts[sensor_on, 1],
-                s=70,
-                facecolors="none",
-                edgecolors="cyan",
-                linewidths=1.5,
-            )
-        ax_sa.scatter(full_tr[0, 0], full_tr[0, 1], c="w", s=50, marker="X")
-        ax_sa.scatter(tr[-1, 0], tr[-1, 1], c="yellow", s=35)
-        ax_sa.set_title("Map: Sensor Lambda (100 Steps)")
-        ax_sa.set_aspect("equal")
-        ax_sa.set_xlim(0, 1)
-        ax_sa.set_ylim(0, 1)
-        if i == 0:
-            legend_handles_sa = [
-                Line2D([0], [0], marker="o", linestyle="None", markersize=5, markerfacecolor="red", markeredgecolor="none", alpha=0.55, label="Tail (lambda color)"),
-                Line2D([0], [0], marker="o", linestyle="None", markersize=7, markerfacecolor="red", markeredgecolor="black", label="Head (lambda color)"),
-                Line2D([0], [0], marker="o", linestyle="None", markersize=8, markerfacecolor="none", markeredgecolor="cyan", label=f"Sensor ON (lambda >= {SENSOR_ON_THRESHOLD:.1f})"),
-                Line2D([0], [0], marker="X", linestyle="None", markersize=7, markerfacecolor="white", markeredgecolor="white", label="Plan start"),
-                Line2D([0], [0], marker="o", linestyle="None", markersize=6, markerfacecolor="yellow", markeredgecolor="none", label="Executed head end"),
-            ]
-            ax_sa.legend(handles=legend_handles_sa, loc="lower left", fontsize=7, framealpha=0.8)
+        # sensor_on = lam_i >= SENSOR_ON_THRESHOLD
+        # if np.any(sensor_on):
+        #     ax_sa.scatter(
+        #         full_pts[sensor_on, 0],
+        #         full_pts[sensor_on, 1],
+        #         s=70,
+        #         facecolors="none",
+        #         edgecolors="cyan",
+        #         linewidths=1.5,
+        #     )
+        # ax_sa.scatter(full_tr[0, 0], full_tr[0, 1], c="w", s=50, marker="X")
+        # ax_sa.scatter(tr[-1, 0], tr[-1, 1], c="yellow", s=35)
+        # ax_sa.set_title("Map: Sensor Lambda (100 Steps)")
+        # ax_sa.set_aspect("equal")
+        # ax_sa.set_xlim(0, 1)
+        # ax_sa.set_ylim(0, 1)
+        # if i == 0:
+        #     legend_handles_sa = [
+        #         Line2D([0], [0], marker="o", linestyle="None", markersize=5, markerfacecolor="red", markeredgecolor="none", alpha=0.55, label="Tail (lambda color)"),
+        #         Line2D([0], [0], marker="o", linestyle="None", markersize=7, markerfacecolor="red", markeredgecolor="black", label="Head (lambda color)"),
+        #         Line2D([0], [0], marker="o", linestyle="None", markersize=8, markerfacecolor="none", markeredgecolor="cyan", label=f"Sensor ON (lambda >= {SENSOR_ON_THRESHOLD:.1f})"),
+        #         Line2D([0], [0], marker="X", linestyle="None", markersize=7, markerfacecolor="white", markeredgecolor="white", label="Plan start"),
+        #         Line2D([0], [0], marker="o", linestyle="None", markersize=6, markerfacecolor="yellow", markeredgecolor="none", label="Executed head end"),
+        #     ]
+        #     ax_sa.legend(handles=legend_handles_sa, loc="lower left", fontsize=7, framealpha=0.8)
 
     if background_mode == "phik":
-        fig.suptitle("Background: phik_recon", fontsize=12)
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        plt.title("Fourier Coefficient Map", fontsize=12)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
     else:
-        fig.tight_layout()
+        plt.title("Raw Map", fontsize=12)
+        plt.tight_layout()
 
     # if sc_last is not None:
     #     # Put colorbar in its own axis so bottom-row plots don't get resized.
@@ -818,64 +819,64 @@ def plot_trajectory_figure(background_mode="map"):
 
 
 plot_trajectory_figure(background_mode="map")
-plot_trajectory_figure(background_mode="phik")
+# plot_trajectory_figure(background_mode="phik")
 
-num_cycles = len(trajectory)
-# Extra figure: visualize extract_hotspots(...) output on each cycle map.
-fig_hot, axes_hot = plt.subplots(1, num_cycles, figsize=(4 * num_cycles, 4), squeeze=False)
-for i in range(num_cycles):
-    ax = axes_hot[0, i]
-    phik_i = phik_list[i]
-    phik_recon_flat = torch.matmul(fk_vals_all, phik_i)
-    phik_recon_i = phik_recon_flat.reshape(H, W)
+# num_cycles = len(trajectory)
+# # Extra figure: visualize extract_hotspots(...) output on each cycle map.
+# fig_hot, axes_hot = plt.subplots(1, num_cycles, figsize=(4 * num_cycles, 4), squeeze=False)
+# for i in range(num_cycles):
+#     ax = axes_hot[0, i]
+#     phik_i = phik_list[i]
+#     phik_recon_flat = torch.matmul(fk_vals_all, phik_i)
+#     phik_recon_i = phik_recon_flat.reshape(H, W)
 
-    x0_i = torch.tensor(full_trajectory[i][0, :2], dtype=torch.float32, device=phik_recon_i.device)
-    hotspots_i, scores_i = extract_hotspots(
-        normalize_info_map(phik_recon_i),
-        max_hotspots=MAX_HOTSPOTS,
-        hotspot_quantile=HOTSPOT_QUANTILE,
-        min_sep=HOTSPOT_MIN_SEP,
-    )
-    ordered_goals_i, _ = choose_ordered_goals_from_recon(phik_recon_i, x0_i)
-    hotspots_np = hotspots_i.cpu().numpy()
-    scores_np = scores_i.cpu().numpy()
-    ordered_np = ordered_goals_i.cpu().numpy()
+#     x0_i = torch.tensor(full_trajectory[i][0, :2], dtype=torch.float32, device=phik_recon_i.device)
+#     hotspots_i, scores_i = extract_hotspots(
+#         normalize_info_map(phik_recon_i),
+#         max_hotspots=MAX_HOTSPOTS,
+#         hotspot_quantile=HOTSPOT_QUANTILE,
+#         min_sep=HOTSPOT_MIN_SEP,
+#     )
+#     ordered_goals_i, _ = choose_ordered_goals_from_recon(phik_recon_i, x0_i)
+#     hotspots_np = hotspots_i.cpu().numpy()
+#     scores_np = scores_i.cpu().numpy()
+#     ordered_np = ordered_goals_i.cpu().numpy()
 
-    phik_recon_i = phik_recon_flat.reshape(H, W).cpu().numpy()
-    ax.imshow(phik_recon_i, extent=[0, 1, 0, 1], origin="lower", cmap="viridis")
-    ax.contourf(X.numpy(), Y.numpy(), phik_recon_i, cmap="viridis")
-    ax.scatter(hotspots_np[:, 0], hotspots_np[:, 1], c="white", s=80, marker="X", edgecolors="black", linewidths=0.8)
-    ax.scatter(ordered_np[:, 0], ordered_np[:, 1], c="gold", s=95, marker="o", edgecolors="black", linewidths=0.9)
-    if ordered_np.shape[0] >= 2:
-        ax.plot(ordered_np[:, 0], ordered_np[:, 1], color="gold", linewidth=1.2, alpha=0.9)
-    for j in range(hotspots_np.shape[0]):
-        ax.text(
-            hotspots_np[j, 0] + 0.01,
-            hotspots_np[j, 1] + 0.01,
-            f"{j + 1}:{scores_np[j]:.2f}",
-            color="white",
-            fontsize=8,
-            weight="bold",
-        )
-    for j in range(ordered_np.shape[0]):
-        ax.text(
-            ordered_np[j, 0] + 0.012,
-            ordered_np[j, 1] - 0.02,
-            f"h{j + 1}",
-            color="gold",
-            fontsize=8,
-            weight="bold",
-        )
-    ax.set_title(f"Map {i + 1}: Extracted Hotspots")
-    ax.set_aspect("equal")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    if i == 0:
-        handles = [
-            Line2D([0], [0], marker="X", linestyle="None", markersize=8, markerfacecolor="white", markeredgecolor="black", label="Hotspot"),
-            Line2D([0], [0], marker="o", linestyle="None", markersize=8, markerfacecolor="gold", markeredgecolor="black", label="choose_ordered_goals (h1-h3)"),
-        ]
-        ax.legend(handles=handles, loc="lower left", fontsize=8, framealpha=0.85)
+#     phik_recon_i = phik_recon_flat.reshape(H, W).cpu().numpy()
+#     ax.imshow(phik_recon_i, extent=[0, 1, 0, 1], origin="lower", cmap="viridis")
+#     ax.contourf(X.numpy(), Y.numpy(), phik_recon_i, cmap="viridis")
+#     # ax.scatter(hotspots_np[:, 0], hotspots_np[:, 1], c="white", s=80, marker="X", edgecolors="black", linewidths=0.8)
+#     # ax.scatter(ordered_np[:, 0], ordered_np[:, 1], c="gold", s=95, marker="o", edgecolors="black", linewidths=0.9)
+#     # if ordered_np.shape[0] >= 2:
+#     #     ax.plot(ordered_np[:, 0], ordered_np[:, 1], color="gold", linewidth=1.2, alpha=0.9)
+#     # for j in range(hotspots_np.shape[0]):
+#     #     ax.text(
+#     #         hotspots_np[j, 0] + 0.01,
+#     #         hotspots_np[j, 1] + 0.01,
+#     #         f"{j + 1}:{scores_np[j]:.2f}",
+#     #         color="white",
+#     #         fontsize=8,
+#     #         weight="bold",
+#     #     )
+#     # for j in range(ordered_np.shape[0]):
+#     #     ax.text(
+#     #         ordered_np[j, 0] + 0.012,
+#     #         ordered_np[j, 1] - 0.02,
+#     #         f"h{j + 1}",
+#     #         color="gold",
+#     #         fontsize=8,
+#     #         weight="bold",
+#     #     )
+#     ax.set_title(f"Map {i + 1}: Extracted Hotspots")
+#     ax.set_aspect("equal")
+#     ax.set_xlim(0, 1)
+#     ax.set_ylim(0, 1)
+#     # if i == 0:
+#     #     handles = [
+#     #         Line2D([0], [0], marker="X", linestyle="None", markersize=8, markerfacecolor="white", markeredgecolor="black", label="Hotspot"),
+#     #         Line2D([0], [0], marker="o", linestyle="None", markersize=8, markerfacecolor="gold", markeredgecolor="black", label="choose_ordered_goals (h1-h3)"),
+#     #     ]
+#     #     ax.legend(handles=handles, loc="lower left", fontsize=8, framealpha=0.85)
 
-fig_hot.tight_layout()
+# fig_hot.tight_layout()
 plt.show()
